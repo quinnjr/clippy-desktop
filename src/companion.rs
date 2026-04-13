@@ -100,4 +100,20 @@ impl CompanionState {
             self.position = (clamped_x, clamped_y);
         }
     }
+
+    /// Update animation frame index
+    /// Frame rate: ~10 FPS (100ms per frame)
+    pub fn update_animation_frame(&mut self, frame_count: usize) {
+        if frame_count == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+        const FRAME_DURATION: Duration = Duration::from_millis(100);
+
+        if now.duration_since(self.frame_timer) >= FRAME_DURATION {
+            self.current_frame = (self.current_frame + 1) % frame_count;
+            self.frame_timer = now;
+        }
+    }
 }
