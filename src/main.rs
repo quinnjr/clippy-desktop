@@ -208,6 +208,16 @@ impl ApplicationHandler for ClippyApp {
 }
 
 fn main() {
+    // Detect Wayland and warn about positioning limitations
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            eprintln!("Warning: Running on Wayland without layer-shell support.");
+            eprintln!("Window positioning is controlled by compositor - wandering behavior limited.");
+            eprintln!("Run under XWayland for full positioning control.");
+        }
+    }
+
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
