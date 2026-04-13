@@ -118,7 +118,7 @@ struct CompanionState {
    - Choose random walk duration (1-3 seconds)
    - Transition to Walking state
 3. While walking:
-   - Move 2-5 pixels per frame at 60 FPS
+   - Move 3 pixels per frame at 60 FPS (constant speed for initial implementation)
    - Update window position via `set_outer_position()`
    - Check screen boundaries - if hit edge, end walk early
 
@@ -176,7 +176,12 @@ Implement native context menus per platform:
 
 **Solutions:**
 1. **Primary approach:** Detect Wayland and use `wlr-layer-shell` protocol if available (allows overlay positioning)
-2. **Fallback:** On restricted Wayland, accept compositor placement and warn user that wandering is limited
+2. **Fallback:** On restricted Wayland, accept compositor placement and print warning to stderr on startup:
+   ```
+   Warning: Running on Wayland without layer-shell support.
+   Window positioning is controlled by compositor - wandering behavior limited.
+   Run under XWayland for full positioning control.
+   ```
 3. **Alternative:** User can run under XWayland (X11 compatibility layer) for full positioning control
 
 This limitation will be documented in the README for Wayland users.
@@ -185,15 +190,17 @@ This limitation will be documented in the README for Wayland users.
 
 ### Sprite Acquisition
 
-Clippy sprites will be sourced from:
-1. Archive.org Windows XP/Office assistant asset dumps
-2. Community sprite sheet repositories
-3. Individual PNG frames extracted from original Office files
+**Sprite dimensions:** Target 128x128 pixels per frame. Will scale if source sprites are different sizes.
+
+**Source strategy:**
+1. Search Archive.org and community repositories for Microsoft Office Assistant sprites
+2. If unavailable, create simple placeholder sprite (paperclip shape) for initial implementation
+3. Sprites can be replaced later without code changes (just swap asset files)
 
 **Required sprites:**
-- Idle animation frames (4-8 frames)
+- Idle animation frames (4-8 frames, or single static frame)
 - Walk left animation frames (4-8 frames)
-- Walk right animation frames (can mirror walk-left if unavailable)
+- Walk right animation frames (can horizontally flip walk-left if unavailable)
 
 ### Asset Loading
 
