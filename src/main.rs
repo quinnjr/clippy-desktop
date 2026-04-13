@@ -2,10 +2,12 @@ pub mod animation;
 pub mod sprite;
 pub mod companion;
 pub mod renderer;
+pub mod platform;
 
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{WindowEvent, MouseButton, ElementState};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId, WindowAttributes};
 use winit::dpi::PhysicalPosition;
 use std::sync::Arc;
@@ -157,6 +159,26 @@ impl ApplicationHandler for ClippyApp {
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                // Handle right-click to show context menu
+                if button == MouseButton::Right && state == ElementState::Released {
+                    if let Some(window) = &self.window {
+                        let position = window.outer_position().unwrap_or_default();
+                        let should_quit = platform::show_context_menu(position.x, position.y);
+                        if should_quit {
+                            event_loop.exit();
+                        }
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                // Handle Escape key for fallback quit (especially useful on Linux without GTK)
+                if event.state == ElementState::Released {
+                    if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
+                        event_loop.exit();
+                    }
+                }
             }
             WindowEvent::RedrawRequested => {
                 // Rate limiting for 60 FPS
