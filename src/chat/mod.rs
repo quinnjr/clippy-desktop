@@ -108,18 +108,38 @@ impl ChatState {
         self.history.iter().skip(1)
     }
 
-    /// Records a new user message and returns the messages to send (the system
-    /// prompt plus the most recent turns).
+    /// Records a new user message and returns the messages to send.
     pub fn begin_user(&mut self, text: &str) -> Vec<Message> {
         self.history.push(Message::user(text));
         self.streaming.clear();
         self.status = Status::Waiting;
+        self.request_messages()
+    }
 
-        let mut to_send = Vec::new();
+    /// The system prompt plus the most recent turns, cleaned so the tail starts
+    /// with a user turn and no two consecutive turns share a role — a failed
+    /// prompt followed by a retry, or a window that starts mid-exchange, would
+    /// otherwise send an order that stricter servers reject.
+    fn request_messages(&self) -> Vec<Message> {
+        let tail = &self.history[1..];
+        let start = tail.len().saturating_sub(MAX_SENT_MESSAGES);
+        let mut cleaned: Vec<Message> = Vec::new();
+        for message in &tail[start..] {
+            // Skip a leading assistant so the conversation begins with a user.
+            if cleaned.is_empty() && message.role != "user" {
+                continue;
+            }
+            match cleaned.last_mut() {
+                Some(last) if last.role == message.role => {
+                    last.content.push_str("\n\n");
+                    last.content.push_str(&message.content);
+                }
+                _ => cleaned.push(message.clone()),
+            }
+        }
+        let mut to_send = Vec::with_capacity(cleaned.len() + 1);
         to_send.push(self.history[0].clone());
-        let recent = self.history.len().saturating_sub(1).min(MAX_SENT_MESSAGES);
-        let start = self.history.len() - recent;
-        to_send.extend(self.history[start..].iter().cloned());
+        to_send.extend(cleaned);
         to_send
     }
 
@@ -128,17 +148,27 @@ impl ChatState {
         self.streaming.push_str(text);
     }
 
-    /// Finalises the streamed reply into the transcript.
-    pub fn on_done(&mut self) {
+    /// Finalises the streamed reply into the transcript. Returns `true` if a
+    /// non-empty reply was recorded (an empty one is dropped).
+    pub fn on_done(&mut self) -> bool {
         let reply = std::mem::take(&mut self.streaming);
-        if !reply.trim().is_empty() {
-            self.history.push(Message::assistant(reply));
-        }
         self.status = Status::Idle;
+        if reply.trim().is_empty() {
+            return false;
+        }
+        self.history.push(Message::assistant(reply));
+        true
     }
 
     pub fn on_error(&mut self, message: String) {
         self.streaming.clear();
         self.status = Status::Error(message);
+    }
+
+    /// Abandons an in-flight reply: drop the partial text and go idle. The
+    /// user's question stays in the transcript so it can be retried.
+    pub fn cancel(&mut self) {
+        self.streaming.clear();
+        self.status = Status::Idle;
     }
 }

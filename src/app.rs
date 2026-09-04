@@ -254,37 +254,91 @@ impl App {
         if self.balloon_open == open {
             return;
         }
+        // Closing mid-reply abandons the request so Clippy does not keep
+        // thinking with no balloon (and later react out of nowhere).
+        if !open {
+            self.cancel_request(Instant::now());
+        }
         self.balloon_open = open;
         if open {
             self.balloon_focus = true;
         }
+
+        let new_logical = self.window_logical();
         let Some(state) = &self.state else {
             return;
         };
         let scale_factor = state.window.scale_factor();
         let old = state.window.inner_size();
-        let old_pos = state.window.outer_position().unwrap_or_default();
-        let new_logical = self.window_logical();
+        // Without a readable position (e.g. Wayland) the compositor owns
+        // placement; just ask for the new size.
+        let Ok(old_pos) = state.window.outer_position() else {
+            self.apply_inner_size(state.window.request_inner_size(new_logical));
+            if let Some(state) = &self.state {
+                state.window.request_redraw();
+            }
+            return;
+        };
         let new_w = (new_logical.width * scale_factor).round() as i32;
         let new_h = (new_logical.height * scale_factor).round() as i32;
         let clippy_center_x = old_pos.x + old.width as i32 / 2;
         let clippy_bottom = old_pos.y + old.height as i32;
-        let _ = state.window.request_inner_size(new_logical);
+        let applied = state.window.request_inner_size(new_logical);
         state.window.set_outer_position(PhysicalPosition::new(
             clippy_center_x - new_w / 2,
             clippy_bottom - new_h,
         ));
         state.window.request_redraw();
+        self.apply_inner_size(applied);
+    }
+
+    /// If `request_inner_size` was applied synchronously (no `Resized` event
+    /// follows), resize the GL surface now so the next frame matches.
+    fn apply_inner_size(&self, applied: Option<PhysicalSize<u32>>) {
+        let (Some(size), Some(state), Some(gl_context)) =
+            (applied, self.state.as_ref(), self.gl_context.as_ref())
+        else {
+            return;
+        };
+        if let (Some(width), Some(height)) =
+            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+        {
+            state.surface.resize(gl_context, width, height);
+        }
+    }
+
+    /// Cancels an in-flight chat request and stops Clippy thinking.
+    fn cancel_request(&mut self, now: Instant) {
+        if self.chat.is_busy() {
+            self.cancel.store(true, Ordering::Relaxed);
+            // Ignore any late events from the retired worker.
+            self.generation += 1;
+            self.chat.cancel();
+            self.companion.release(now);
+        }
+    }
+
+    /// Moves Clippy back to his starting corner (in case he was dragged away).
+    fn recenter(&mut self, event_loop: &ActiveEventLoop) {
+        let logical = self.window_logical();
+        let Some(position) = initial_position(event_loop, logical) else {
+            return;
+        };
+        if let Some(state) = &self.state {
+            state.window.set_outer_position(position);
+            state.window.request_redraw();
+        }
     }
 
     fn right_click(&mut self) {
         if platform::HAS_NATIVE_MENU {
             if let (Some(menu), Some(state)) = (&self.menu, &self.state) {
-                platform::show_context_menu(menu, &state.window);
-                return;
+                if platform::show_context_menu(menu, &state.window) {
+                    return;
+                }
             }
         }
-        // No native menu (Linux): right-click opens the chat instead.
+        // No native menu (Linux), or it could not be shown: open the chat.
         self.set_balloon(true);
     }
 
@@ -325,9 +379,12 @@ impl App {
                 }
             }
             ChatEvent::Done => {
-                self.chat.on_done();
+                let replied = self.chat.on_done();
                 self.companion.release(now);
-                self.companion.perform(ANSWERED, now);
+                // Only celebrate if a reply actually arrived.
+                if replied {
+                    self.companion.perform(ANSWERED, now);
+                }
             }
             ChatEvent::Error(message) => {
                 self.chat.on_error(message);
@@ -656,6 +713,7 @@ impl App {
             }
             Key::Named(NamedKey::Enter) if !self.balloon_open => self.set_balloon(true),
             Key::Named(NamedKey::Space) if !self.balloon_open => self.poke(),
+            Key::Named(NamedKey::Home) if !self.balloon_open => self.recenter(event_loop),
             Key::Character(text) if !self.balloon_open && text.eq_ignore_ascii_case("q") => {
                 event_loop.exit()
             }

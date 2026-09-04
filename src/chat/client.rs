@@ -8,8 +8,9 @@ use super::config::ChatConfig;
 use super::sse::{self, Sse};
 use super::Message;
 use serde::Serialize;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 /// Something that happened while talking to the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,11 +59,16 @@ pub fn stream(
         }
     };
 
-    // Read error responses ourselves instead of letting ureq turn a 4xx/5xx
-    // into an opaque error, so the server's own message reaches the balloon.
+    // Bound the connect and the wait for the response to *start* so a server
+    // that accepts the socket but never answers cannot pin Clippy in the
+    // "thinking" state forever; the stream body itself is left untimed, as it
+    // may legitimately take a while. Read error responses ourselves so the
+    // server's own message reaches the balloon.
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(15)))
+            .timeout_recv_response(Some(Duration::from_secs(60)))
             .build(),
     );
     let mut builder = agent
@@ -83,12 +89,6 @@ pub fn stream(
     }
 
     let status = response.status();
-    let is_stream = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.contains("event-stream"))
-        .unwrap_or(false);
 
     if !status.is_success() {
         let mut text = String::new();
@@ -112,18 +112,57 @@ pub fn stream(
         )));
     }
 
-    if is_stream {
-        stream_sse(response.into_body().into_reader(), cancel, &mut sink);
-    } else {
-        // A server that ignored `stream: true` and sent one JSON object.
-        let mut text = String::new();
-        if let Err(err) = response.into_body().into_reader().read_to_string(&mut text) {
-            return sink(ChatEvent::Error(format!("could not read the reply: {err}")));
+    // Whether the reply streams (SSE) or arrives as one JSON object is decided
+    // from the body itself, not just the Content-Type, so a mislabelled server
+    // still works.
+    stream_reply(response.into_body().into_reader(), cancel, &mut sink);
+}
+
+/// Reads the reply, telling an SSE stream from a single JSON object by looking
+/// at the first line of the body.
+fn stream_reply(reader: impl Read, cancel: &AtomicBool, sink: &mut impl FnMut(ChatEvent)) {
+    let mut reader = BufReader::new(reader);
+    let first = loop {
+        match read_line_lossy(&mut reader) {
+            Ok(None) => return sink(ChatEvent::Done),
+            Ok(Some(line)) if line.trim().is_empty() => {}
+            Ok(Some(line)) => break line,
+            Err(err) => return sink(ChatEvent::Error(format!("could not read the reply: {err}"))),
         }
-        if cancel.load(Ordering::Relaxed) {
+    };
+
+    let head = first.trim_start();
+    let looks_like_sse =
+        head.starts_with("data:") || head.starts_with("event:") || head.starts_with(':');
+
+    if looks_like_sse {
+        if !feed(&first, sink) {
             return;
         }
-        match sse::parse_full(&text) {
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            match read_line_lossy(&mut reader) {
+                Ok(None) => break,
+                Ok(Some(line)) => {
+                    if !feed(&line, sink) {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    return sink(ChatEvent::Error(format!("the connection dropped: {err}")))
+                }
+            }
+        }
+        // The body ended without an explicit [DONE]; treat that as a clean finish.
+        sink(ChatEvent::Done);
+    } else {
+        // One JSON object (a server that ignored `stream: true`).
+        let mut rest = Vec::new();
+        let _ = reader.read_to_end(&mut rest);
+        let body = format!("{first}{}", String::from_utf8_lossy(&rest));
+        match sse::parse_full(&body) {
             Ok(content) => {
                 if !content.is_empty() {
                     sink(ChatEvent::Delta(content));
@@ -135,24 +174,35 @@ pub fn stream(
     }
 }
 
-fn stream_sse(reader: impl Read, cancel: &AtomicBool, sink: &mut impl FnMut(ChatEvent)) {
-    let reader = BufReader::new(reader);
-    for line in reader.lines() {
-        if cancel.load(Ordering::Relaxed) {
-            return;
+/// Handles one SSE line, returning `false` once the stream is done.
+fn feed(line: &str, sink: &mut impl FnMut(ChatEvent)) -> bool {
+    match sse::parse_line(line) {
+        Sse::Delta(text) => {
+            sink(ChatEvent::Delta(text));
+            true
         }
-        let line = match line {
-            Ok(line) => line,
-            Err(err) => return sink(ChatEvent::Error(format!("the connection dropped: {err}"))),
-        };
-        match sse::parse_line(&line) {
-            Sse::Delta(text) => sink(ChatEvent::Delta(text)),
-            Sse::Done => return sink(ChatEvent::Done),
-            Sse::Ignore => {}
+        Sse::Done => {
+            sink(ChatEvent::Done);
+            false
+        }
+        Sse::Ignore => true,
+    }
+}
+
+/// Reads one line, replacing invalid UTF-8 rather than failing, with the
+/// trailing newline stripped. `Ok(None)` marks the end of the stream.
+fn read_line_lossy(reader: &mut impl BufRead) -> io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    if reader.read_until(b'\n', &mut buf)? == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
         }
     }
-    // The body ended without an explicit [DONE]; treat that as a clean finish.
-    sink(ChatEvent::Done);
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
 fn send_error(url: &str, err: &ureq::Error) -> String {

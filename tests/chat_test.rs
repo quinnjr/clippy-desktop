@@ -134,6 +134,59 @@ fn chat_state_tracks_a_turn_from_prompt_to_reply() {
     assert_eq!(turns[1], &Message::assistant("Hi there"));
 }
 
+fn roles(messages: &[Message]) -> Vec<&str> {
+    messages.iter().map(|m| m.role.as_str()).collect()
+}
+
+fn configured() -> ChatState {
+    ChatState::new(Ok(ChatConfig {
+        base_url: "http://h/v1".into(),
+        model: "m".into(),
+        api_key: None,
+    }))
+}
+
+#[test]
+fn a_failed_turn_does_not_send_two_user_messages() {
+    let mut chat = configured();
+    chat.begin_user("q1");
+    chat.on_delta("a1");
+    chat.on_done();
+
+    // q2 fails, so the user retries with q3 while q2 is still in history.
+    chat.begin_user("q2");
+    chat.on_error("boom".to_string());
+    let sent = chat.begin_user("q3");
+
+    assert_eq!(roles(&sent), vec!["system", "user", "assistant", "user"]);
+    let last = &sent.last().unwrap().content;
+    assert!(last.contains("q2") && last.contains("q3"), "{last}");
+    // The transcript still shows every turn the user typed.
+    assert_eq!(chat.turns().count(), 4);
+}
+
+#[test]
+fn a_long_conversation_still_begins_with_a_user_turn() {
+    let mut chat = configured();
+    for i in 0..30 {
+        chat.begin_user(&format!("q{i}"));
+        chat.on_delta(&format!("a{i}"));
+        chat.on_done();
+    }
+    let sent = chat.begin_user("final");
+    assert_eq!(sent[0].role, "system");
+    assert_eq!(
+        sent[1].role, "user",
+        "the window must not start on an assistant turn"
+    );
+    for pair in sent.windows(2) {
+        assert_ne!(
+            pair[0].role, pair[1].role,
+            "no two consecutive turns share a role"
+        );
+    }
+}
+
 #[test]
 fn chat_state_reports_errors_and_missing_config() {
     let mut chat = ChatState::new(Ok(ChatConfig {

@@ -80,6 +80,9 @@ impl Animator {
     ) -> Result<StepEvent, UnknownAnimation> {
         let animation = agent
             .animation(name)
+            // An empty animation has no frame to show, so treat it as unplayable
+            // rather than let `step` index past the end.
+            .filter(|animation| !animation.frames.is_empty())
             .ok_or_else(|| UnknownAnimation(name.to_string()))?;
         self.animation = Some(name.to_string());
         self.frame_index = 0;

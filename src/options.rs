@@ -32,6 +32,7 @@ Controls:
   Enter                             Open the chat balloon and ask him
   Right click                       Menu (Windows and macOS)
   Escape                            Close the balloon, or quit
+  Home                              Bring Clippy back to the corner
   Q                                 Quit";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

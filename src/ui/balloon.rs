@@ -169,7 +169,9 @@ fn prompt_row(
             submitted = Some(input.trim().to_string());
             input.clear();
             response.request_focus();
-        } else if *focus {
+        } else if *focus || enter {
+            // Keep focus when the balloon just opened, and when Enter was pressed
+            // with nothing to send, so the field is not left un-focused.
             response.request_focus();
         }
     });

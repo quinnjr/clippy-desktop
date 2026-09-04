@@ -62,9 +62,9 @@ pub fn resolve_from(
             if model.is_none() {
                 missing.push("a model (--model or OPENAI_MODEL)");
             }
-            Ok(Err(Unconfigured {
+            Err(Unconfigured {
                 message: format!("Chat needs {}.\n{HELP}", missing.join(" and ")),
-            })?)
+            })
         }
     }
 }

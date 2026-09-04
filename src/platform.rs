@@ -22,6 +22,7 @@ mod native {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::Window;
 
+    const CHAT_ID: &str = "chat";
     const ANIMATE_ID: &str = "animate";
     const QUIT_ID: &str = "quit";
 
@@ -32,14 +33,16 @@ mod native {
     impl ContextMenuHandle {
         pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
             let menu = Menu::new();
+            let chat = MenuItem::with_id(CHAT_ID, "Ask Clippy\u{2026}", true, None);
             let animate = MenuItem::with_id(ANIMATE_ID, "Animate!", true, None);
             let quit = MenuItem::with_id(QUIT_ID, "Quit", true, None);
-            menu.append_items(&[&animate, &PredefinedMenuItem::separator(), &quit])?;
+            menu.append_items(&[&chat, &animate, &PredefinedMenuItem::separator(), &quit])?;
             Ok(Self { menu })
         }
 
-        /// Pops the menu up at the pointer. Returns `false` when no native
-        /// menu could be shown.
+        /// Pops the menu up at the pointer. Returns `false` only when no native
+        /// menu could be shown (the selection itself arrives via the event
+        /// handler, so muda's tracking result is not what we report).
         pub fn show(&self, window: &Window) -> bool {
             let Ok(handle) = window.window_handle() else {
                 return false;
@@ -50,16 +53,20 @@ mod native {
                     // SAFETY: the handle comes from a live winit window on this thread.
                     unsafe {
                         self.menu
-                            .show_context_menu_for_hwnd(handle.hwnd.get(), None)
+                            .show_context_menu_for_hwnd(handle.hwnd.get(), None);
                     }
+                    true
                 }
                 #[cfg(target_os = "macos")]
                 RawWindowHandle::AppKit(handle) => {
                     // SAFETY: the handle is the live NSView of a winit window on the main thread.
                     unsafe {
-                        self.menu
-                            .show_context_menu_for_nsview(handle.ns_view.as_ptr() as *const _, None)
+                        self.menu.show_context_menu_for_nsview(
+                            handle.ns_view.as_ptr() as *const _,
+                            None,
+                        );
                     }
+                    true
                 }
                 _ => false,
             }
@@ -73,6 +80,7 @@ mod native {
     {
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let action = match event.id.0.as_str() {
+                CHAT_ID => MenuAction::Chat,
                 ANIMATE_ID => MenuAction::Animate,
                 QUIT_ID => MenuAction::Quit,
                 _ => return,
