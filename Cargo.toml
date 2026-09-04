@@ -1,24 +1,42 @@
 [package]
 name = "clippy-app"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.88"
+description = "Microsoft Clippy, the Office Assistant, living on your desktop"
+license = "MIT"
+publish = false
+
+[lib]
+name = "clippy_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clippy-app"
+path = "src/main.rs"
 
 [dependencies]
+# Windowing (X11, Wayland, Windows, macOS).
 winit = "0.30"
-softbuffer = "0.4"
-image = "0.25"
+# OpenGL context creation with an alpha-capable config on every platform.
+glutin = "0.32"
+glutin-winit = "0.5"
+glow = "0.18"
+raw-window-handle = "0.6"
+# Sprite sheet decoding (PNG only, keeps the build small).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Animation definitions (the original Office Assistant frame tables).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 rand = "0.8"
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+# Native right-click menu on Windows and macOS. Linux uses the keyboard
+# (Escape / Q) because winit has no GTK window for a native popup there.
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+muda = { version = "0.19", default-features = false }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-cocoa = "0.26"
-objc = "0.2"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-gtk = { version = "0.18", optional = true }
-
-[features]
-default = []
-gtk-menu = ["gtk"]
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

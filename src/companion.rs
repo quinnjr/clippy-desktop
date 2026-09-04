@@ -1,119 +1,260 @@
-use std::time::{Duration, Instant};
-use crate::animation::{AnimationState, Direction};
-use rand::Rng;
+//! Clippy's behaviour: greet, rest, fidget through idle animations, and react
+//! when poked. Time is passed in explicitly so the logic is testable.
+//!
+//! Several of the original animations loop forever until the host dismisses
+//! them (`Writing`, `Searching`, the finger-tap fidget, ...). To play those to
+//! a natural close, every animation is given a lifetime of one nominal pass;
+//! once it elapses Clippy asks the animation to wrap up through its exit
+//! branches, exactly the way the original Office Assistant ended a looping
+//! animation.
 
-pub struct CompanionState {
-    pub position: (i32, i32),
-    pub animation_state: AnimationState,
-    pub current_frame: usize,
-    pub frame_timer: Instant,
-    pub behavior_timer: Instant,
-    pub walk_duration: Duration,
-    pub walk_started: Instant,
+use crate::agent::{Agent, Frame, GREETING};
+use crate::animator::{Animator, StepEvent};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use std::time::{Duration, Instant};
+
+/// How long Clippy sits still between idle animations, in milliseconds.
+pub const REST_MS: std::ops::RangeInclusive<u64> = 2000..=6000;
+
+/// Longest Clippy waits for an animation to wrap up after being asked to exit.
+pub const EXIT_GRACE: Duration = Duration::from_millis(1500);
+
+/// Shortest lifetime given to any animation, so nothing flickers past.
+pub const MIN_LIFETIME: Duration = Duration::from_millis(600);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Sitting still on the last frame of the previous animation.
+    Resting { until: Instant },
+    /// Playing one of the idle fidgets.
+    Idle,
+    /// Playing a gesture (the greeting or a reaction to a poke).
+    Gesture,
+    /// Wrapping up an animation so it (and any queued gesture) can end.
+    Exiting { deadline: Instant },
 }
 
-impl CompanionState {
-    pub fn new(screen_width: i32, screen_height: i32, sprite_size: i32) -> Self {
-        let mut rng = rand::thread_rng();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pool {
+    Idle,
+    Gesture,
+}
 
-        // Random starting position within bounds
-        let x = rng.gen_range(0..=(screen_width - sprite_size).max(0));
-        let y = rng.gen_range(0..=(screen_height - sprite_size).max(0));
+pub struct Companion {
+    agent: Agent,
+    animator: Animator,
+    rng: StdRng,
+    mode: Mode,
+    /// When the current idle/gesture should be asked to wrap up.
+    play_until: Instant,
+    pending: Option<String>,
+    last_idle: Option<String>,
+    last_gesture: Option<String>,
+    idle_names: Vec<String>,
+    gesture_names: Vec<String>,
+}
 
-        let now = Instant::now();
+impl Companion {
+    /// Creates Clippy and starts his greeting.
+    pub fn new(agent: Agent, now: Instant) -> Self {
+        Self::with_rng(agent, now, StdRng::from_entropy())
+    }
 
-        Self {
-            position: (x, y),
-            animation_state: AnimationState::Idle,
-            current_frame: 0,
-            frame_timer: now,
-            behavior_timer: now,
-            walk_duration: Duration::from_secs(0),
-            walk_started: now,
+    /// Deterministic variant for tests.
+    pub fn with_seed(agent: Agent, now: Instant, seed: u64) -> Self {
+        Self::with_rng(agent, now, StdRng::seed_from_u64(seed))
+    }
+
+    fn with_rng(agent: Agent, now: Instant, rng: StdRng) -> Self {
+        let idle_names = agent.idle_names();
+        let gesture_names = agent.gesture_names();
+        let mut companion = Self {
+            agent,
+            animator: Animator::new(),
+            rng,
+            mode: Mode::Resting { until: now },
+            play_until: now,
+            pending: None,
+            last_idle: None,
+            last_gesture: None,
+            idle_names,
+            gesture_names,
+        };
+        if companion.agent.animation(GREETING).is_some() {
+            companion.play(GREETING, Mode::Gesture, now);
+        }
+        companion
+    }
+
+    pub fn agent(&self) -> &Agent {
+        &self.agent
+    }
+
+    /// The frame to draw right now (`None` only if nothing has ever played).
+    pub fn frame(&self) -> Option<&Frame> {
+        self.animator.displayed_frame(&self.agent)
+    }
+
+    /// Name of the animation on screen.
+    pub fn animation(&self) -> Option<&str> {
+        self.animator.animation()
+    }
+
+    /// Whether Clippy is sitting still between animations.
+    pub fn is_resting(&self) -> bool {
+        matches!(self.mode, Mode::Resting { .. })
+    }
+
+    /// Identifies the frame on screen, for change detection.
+    pub fn frame_key(&self) -> Option<(String, usize)> {
+        Some((
+            self.animator.animation()?.to_string(),
+            self.animator.displayed_index()?,
+        ))
+    }
+
+    /// When `advance` next needs to run.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        match self.mode {
+            Mode::Resting { until } => Some(until),
+            Mode::Idle | Mode::Gesture => Some(match self.animator.next_deadline() {
+                Some(step) => step.min(self.play_until),
+                None => self.play_until,
+            }),
+            Mode::Exiting { deadline } => Some(match self.animator.next_deadline() {
+                Some(step) => step.min(deadline),
+                None => deadline,
+            }),
         }
     }
 
-    /// Update behavior state (idle/walking transitions)
-    pub fn update_behavior(&mut self) {
-        let now = Instant::now();
-
-        match self.animation_state {
-            AnimationState::Idle => {
-                // Check if it's time to make a behavior decision (2-5 seconds)
-                if now.duration_since(self.behavior_timer) >= Duration::from_secs(2) {
-                    let mut rng = rand::thread_rng();
-
-                    // 60% chance to start walking
-                    if rng.gen_bool(0.6) {
-                        // Choose random direction
-                        let direction = if rng.gen_bool(0.5) {
-                            Direction::Left
-                        } else {
-                            Direction::Right
-                        };
-
-                        // Choose random walk duration (1-3 seconds)
-                        let duration_ms = rng.gen_range(1000..=3000);
-
-                        self.animation_state = AnimationState::Walking { direction };
-                        self.walk_duration = Duration::from_millis(duration_ms);
-                        self.walk_started = now;
-                    }
-
-                    // Reset behavior timer (2-5 second random interval)
-                    let next_check_ms = rng.gen_range(2000..=5000);
-                    self.behavior_timer = now - Duration::from_millis(rng.gen_range(0..next_check_ms));
-                }
-            }
-            AnimationState::Walking { .. } => {
-                // Check if walk duration has expired
-                if now.duration_since(self.walk_started) >= self.walk_duration {
-                    self.animation_state = AnimationState::Idle;
-                    self.behavior_timer = now;
-                }
-            }
-        }
-    }
-
-    /// Update position based on current animation state
-    /// Movement speed: 3 pixels per frame at 60 FPS
-    pub fn update_position(&mut self, screen_width: i32, screen_height: i32, sprite_size: i32) {
-        if let AnimationState::Walking { direction } = self.animation_state {
-            const SPEED: i32 = 3; // pixels per frame
-
-            let (x, y) = self.position;
-            let new_x = match direction {
-                Direction::Left => x - SPEED,
-                Direction::Right => x + SPEED,
+    /// Moves time forward. Returns `true` when the frame on screen changed.
+    pub fn advance(&mut self, now: Instant) -> bool {
+        let before = self.frame_key();
+        // A running animation that has outstayed its lifetime is asked to wrap
+        // up; from here the shared Exiting path drives it to its close.
+        if matches!(self.mode, Mode::Idle | Mode::Gesture) && now >= self.play_until {
+            self.animator.exit();
+            self.mode = Mode::Exiting {
+                deadline: now + EXIT_GRACE,
             };
-
-            // Clamp to screen bounds
-            let clamped_x = new_x.clamp(0, (screen_width - sprite_size).max(0));
-            let clamped_y = y.clamp(0, (screen_height - sprite_size).max(0));
-
-            // If hit boundary, end walk early
-            if clamped_x != new_x {
-                self.animation_state = AnimationState::Idle;
-                self.behavior_timer = Instant::now();
+        }
+        match self.mode {
+            Mode::Resting { until } => {
+                if now >= until {
+                    self.play_idle(now);
+                }
             }
+            Mode::Idle | Mode::Gesture => {
+                if self.animator.advance(&self.agent, now, &mut self.rng) == StepEvent::Exited {
+                    self.finish(now);
+                }
+            }
+            Mode::Exiting { deadline } => {
+                let event = self.animator.advance(&self.agent, now, &mut self.rng);
+                if event == StepEvent::Exited || now >= deadline {
+                    self.finish(now);
+                }
+            }
+        }
+        self.frame_key() != before
+    }
 
-            self.position = (clamped_x, clamped_y);
+    /// The user clicked Clippy: play a gesture as soon as it makes sense.
+    pub fn poke(&mut self, now: Instant) {
+        let Some(gesture) = self.pick(Pool::Gesture) else {
+            return;
+        };
+        match self.mode {
+            Mode::Resting { .. } => {
+                self.last_gesture = Some(gesture.clone());
+                self.play(&gesture, Mode::Gesture, now);
+            }
+            Mode::Idle => {
+                self.pending = Some(gesture);
+                self.animator.exit();
+                self.mode = Mode::Exiting {
+                    deadline: now + EXIT_GRACE,
+                };
+            }
+            Mode::Gesture | Mode::Exiting { .. } => {
+                if self.pending.is_none() {
+                    self.pending = Some(gesture);
+                }
+            }
         }
     }
 
-    /// Update animation frame index
-    /// Frame rate: ~10 FPS (100ms per frame)
-    pub fn update_animation_frame(&mut self, frame_count: usize) {
-        if frame_count == 0 {
-            return;
+    /// The current animation ended: play what is queued, or rest.
+    fn finish(&mut self, now: Instant) {
+        match self.pending.take() {
+            Some(gesture) => {
+                self.last_gesture = Some(gesture.clone());
+                self.play(&gesture, Mode::Gesture, now);
+            }
+            None => self.rest(now),
         }
+    }
 
-        let now = Instant::now();
-        const FRAME_DURATION: Duration = Duration::from_millis(100);
+    fn rest(&mut self, now: Instant) {
+        self.animator.hold();
+        let millis = self.rng.gen_range(REST_MS);
+        self.mode = Mode::Resting {
+            until: now + Duration::from_millis(millis),
+        };
+    }
 
-        if now.duration_since(self.frame_timer) >= FRAME_DURATION {
-            self.current_frame = (self.current_frame + 1) % frame_count;
-            self.frame_timer = now;
+    fn play_idle(&mut self, now: Instant) {
+        match self.pick(Pool::Idle) {
+            Some(name) => {
+                self.last_idle = Some(name.clone());
+                self.play(&name, Mode::Idle, now);
+            }
+            None => self.rest(now),
         }
+    }
+
+    fn play(&mut self, name: &str, mode: Mode, now: Instant) {
+        match self.animator.play(&self.agent, name, now, &mut self.rng) {
+            Ok(StepEvent::Continue) => {
+                self.play_until = now + self.lifetime(name);
+                self.mode = mode;
+            }
+            // A one-frame animation is over as soon as it starts.
+            Ok(StepEvent::Exited) => self.rest(now),
+            Err(_) => self.rest(now),
+        }
+    }
+
+    /// One nominal pass through the animation, with a small floor.
+    fn lifetime(&self, name: &str) -> Duration {
+        self.agent
+            .animation(name)
+            .map(|animation| animation.total_duration().max(MIN_LIFETIME))
+            .unwrap_or(MIN_LIFETIME)
+    }
+
+    /// Picks a random name from a pool, avoiding an immediate repeat when
+    /// the pool offers a choice.
+    fn pick(&mut self, pool: Pool) -> Option<String> {
+        let (names, avoid) = match pool {
+            Pool::Idle => (&self.idle_names, self.last_idle.as_deref()),
+            Pool::Gesture => (&self.gesture_names, self.last_gesture.as_deref()),
+        };
+        if names.is_empty() {
+            return None;
+        }
+        let candidates: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| Some(*name) != avoid)
+            .collect();
+        let chosen = if candidates.is_empty() {
+            names[0].as_str()
+        } else {
+            candidates[self.rng.gen_range(0..candidates.len())]
+        };
+        Some(chosen.to_string())
     }
 }

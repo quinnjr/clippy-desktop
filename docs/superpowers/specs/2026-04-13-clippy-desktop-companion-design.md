@@ -1,7 +1,7 @@
 # Clippy Desktop Companion - Design Specification
 
 **Date:** 2026-04-13  
-**Status:** Approved
+**Status:** Superseded by `2026-09-04-real-clippy-design.md`
 
 ## Overview
 

@@ -1,87 +1,99 @@
-use image::RgbaImage;
-use crate::animation::{AnimationState, Direction};
+//! Sprite sheet decoding and per-frame compositing.
+//!
+//! The sheet is kept as straight-alpha RGBA exactly as decoded. Frames are
+//! composited on demand into a small premultiplied-alpha buffer, which is
+//! what every desktop compositor expects from a transparent window.
+
+/// The Clippy sprite sheet: an RGBA PNG with a fully transparent background.
+pub const CLIPPY_SHEET_PNG: &[u8] = include_bytes!("../assets/clippy/map.png");
 
 pub struct SpriteSheet {
-    pub idle_frames: Vec<RgbaImage>,
-    pub walk_left_frames: Vec<RgbaImage>,
-    pub walk_right_frames: Vec<RgbaImage>,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
 }
 
 impl SpriteSheet {
-    /// Load sprites embedded in binary at compile time
-    pub fn load_embedded() -> Self {
-        let idle = Self::load_image_from_bytes(include_bytes!("../assets/sprites/idle.png"))
-            .expect("Failed to load idle.png");
+    /// Decodes a PNG sprite sheet into straight-alpha RGBA.
+    pub fn decode_png(bytes: &[u8]) -> Result<Self, image::ImageError> {
+        let image =
+            image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?.into_rgba8();
+        Ok(Self {
+            width: image.width(),
+            height: image.height(),
+            rgba: image.into_raw(),
+        })
+    }
 
-        let walk_left_frames = (0..4)
-            .map(|i| {
-                let bytes: &[u8] = match i {
-                    0 => include_bytes!("../assets/sprites/walk_left_0.png"),
-                    1 => include_bytes!("../assets/sprites/walk_left_1.png"),
-                    2 => include_bytes!("../assets/sprites/walk_left_2.png"),
-                    3 => include_bytes!("../assets/sprites/walk_left_3.png"),
-                    _ => unreachable!(),
-                };
-                Self::load_image_from_bytes(bytes)
-                    .expect(&format!("Failed to load walk_left_{}.png", i))
-            })
-            .collect();
+    /// The embedded Clippy sheet.
+    pub fn clippy() -> Self {
+        Self::decode_png(CLIPPY_SHEET_PNG).expect("embedded map.png is a valid PNG")
+    }
 
-        // For walk_right, horizontally flip walk_left frames
-        let walk_right_frames = (0..4)
-            .map(|i| {
-                let bytes: &[u8] = match i {
-                    0 => include_bytes!("../assets/sprites/walk_left_0.png"),
-                    1 => include_bytes!("../assets/sprites/walk_left_1.png"),
-                    2 => include_bytes!("../assets/sprites/walk_left_2.png"),
-                    3 => include_bytes!("../assets/sprites/walk_left_3.png"),
-                    _ => unreachable!(),
-                };
-                let img = Self::load_image_from_bytes(bytes)
-                    .expect(&format!("Failed to load walk_left_{}.png for flipping", i));
-                image::imageops::flip_horizontal(&img)
-            })
-            .collect();
+    pub fn width(&self) -> u32 {
+        self.width
+    }
 
-        Self {
-            idle_frames: vec![idle],
-            walk_left_frames,
-            walk_right_frames,
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Straight-alpha RGBA of one sheet pixel; transparent black outside the sheet.
+    pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+        if x >= self.width || y >= self.height {
+            return [0, 0, 0, 0];
+        }
+        let offset = ((y * self.width + x) * 4) as usize;
+        let px = &self.rgba[offset..offset + 4];
+        [px[0], px[1], px[2], px[3]]
+    }
+
+    /// Composites the given sheet cells (bottom first) into `out` as
+    /// premultiplied RGBA, `frame_width * frame_height * 4` bytes, top row first.
+    pub fn compose(
+        &self,
+        cells: &[[u32; 2]],
+        frame_width: u32,
+        frame_height: u32,
+        out: &mut Vec<u8>,
+    ) {
+        let len = (frame_width * frame_height * 4) as usize;
+        out.clear();
+        out.resize(len, 0);
+        for &[cell_x, cell_y] in cells {
+            for y in 0..frame_height {
+                for x in 0..frame_width {
+                    let src = premultiply(self.pixel(cell_x + x, cell_y + y));
+                    if src[3] == 0 {
+                        continue;
+                    }
+                    let offset = ((y * frame_width + x) * 4) as usize;
+                    let dst: &mut [u8] = &mut out[offset..offset + 4];
+                    let blended = blend_over([dst[0], dst[1], dst[2], dst[3]], src);
+                    dst.copy_from_slice(&blended);
+                }
+            }
         }
     }
+}
 
-    fn load_image_from_bytes(bytes: &[u8]) -> Result<RgbaImage, image::ImageError> {
-        let img = image::load_from_memory(bytes)?;
-        Ok(img.to_rgba8())
+/// Converts straight-alpha RGBA to premultiplied RGBA.
+pub fn premultiply([r, g, b, a]: [u8; 4]) -> [u8; 4] {
+    if a == 255 {
+        return [r, g, b, a];
     }
+    let mul = |c: u8| ((c as u32 * a as u32 + 127) / 255) as u8;
+    [mul(r), mul(g), mul(b), a]
+}
 
-    /// Get frame for given animation state and frame index
-    pub fn get_frame(&self, state: &AnimationState, frame_index: usize) -> Option<&RgbaImage> {
-        let frames = match state {
-            AnimationState::Idle => &self.idle_frames,
-            AnimationState::Walking {
-                direction: Direction::Left,
-            } => &self.walk_left_frames,
-            AnimationState::Walking {
-                direction: Direction::Right,
-            } => &self.walk_right_frames,
-        };
-
-        if frames.is_empty() {
-            return None;
-        }
-
-        // Wrap frame index to array bounds
-        let index = frame_index % frames.len();
-        Some(&frames[index])
-    }
-
-    /// Get dimensions of sprites (assumes all frames same size)
-    pub fn sprite_dimensions(&self) -> (u32, u32) {
-        if let Some(frame) = self.idle_frames.first() {
-            (frame.width(), frame.height())
-        } else {
-            (128, 128) // Default
-        }
-    }
+/// Source-over blend of two premultiplied RGBA pixels.
+pub fn blend_over(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
+    let inv = 255 - src[3] as u32;
+    let mix = |s: u8, d: u8| (s as u32 + (d as u32 * inv + 127) / 255).min(255) as u8;
+    [
+        mix(src[0], dst[0]),
+        mix(src[1], dst[1]),
+        mix(src[2], dst[2]),
+        mix(src[3], dst[3]),
+    ]
 }
