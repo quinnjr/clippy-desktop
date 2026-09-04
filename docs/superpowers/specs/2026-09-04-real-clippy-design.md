@@ -131,3 +131,42 @@ no primary monitor and ignores positions; the compositor places the window.
 - Manual on Linux: run under X11 (XWayland) and Wayland (labwc) over a solid
   backdrop; a script matches the on-screen pixels against the sprite sheet
   and confirms the rest of the window shows the backdrop.
+
+---
+
+## Addendum: Chat (2026-09-04)
+
+Clippy gained a prompt box that talks to any OpenAI-compatible server.
+
+**Decisions** (asked and answered): an authentic speech balloon anchored to
+Clippy (not a separate window); no default server — require `--base-url` and
+`--model` (or `OPENAI_BASE_URL` / `OPENAI_MODEL`, plus optional
+`OPENAI_API_KEY`), with a friendly message when unset. Verified against a local
+mock server.
+
+**UI.** The balloon is `egui`, drawn by `egui_glow` into the *same* GL context
+as the sprite (both share one `Arc<glow::Context>`; `glow` pinned to 0.16 to
+match `egui_glow` 0.33). When the balloon opens the borderless window grows
+upward to hold the balloon above Clippy and shrinks back when it closes,
+keeping him anchored; on Wayland the compositor owns placement. Clippy is drawn
+into the bottom sub-rectangle via a viewport; egui paints the balloon over the
+top; the rest of the window stays transparent. `egui-winit` translates input,
+and egui is fed first while the balloon is open so typing does not poke Clippy.
+
+**Networking.** `src/chat/` — `config` resolves flags/env; `sse` parses the
+event stream (and a non-streaming fallback); `client::stream` is a blocking
+`ureq` call (rustls) that runs on a worker thread and reports deltas through a
+`FnMut` sink. The app spawns the worker per prompt and forwards
+`ChatEvent`s over the winit `EventLoopProxy`, tagged with a generation number
+so a superseded request's late events are ignored; an `AtomicBool` cancels a
+reply in flight. Conversation history (capped) is kept so it is a real chat.
+
+**Behaviour.** On submit Clippy holds `Thinking`, switches to `Writing` on the
+first token, and plays `GetAttention` when done or `Alert` on error — using a
+new `Companion` "busy" mode that loops an animation until released.
+
+**Cross-compilation note.** `ureq`'s rustls backend pulls `ring`, whose build
+script needs the target's C/assembler toolchain, so cross-compiling from Linux
+to Windows/macOS fails at `ring` (it builds on a real host). The project's own
+platform-specific Rust was type-checked for `x86_64-pc-windows-msvc` and both
+Apple targets by temporarily dropping ureq's TLS feature.

@@ -21,14 +21,27 @@ winit = "0.30"
 # OpenGL context creation with an alpha-capable config on every platform.
 glutin = "0.32"
 glutin-winit = "0.5"
-glow = "0.18"
+# glow 0.16 to match egui_glow 0.33 so the sprite renderer and egui share one
+# GL context.
+glow = "0.16"
 raw-window-handle = "0.6"
 # Sprite sheet decoding (PNG only, keeps the build small).
 image = { version = "0.25", default-features = false, features = ["png"] }
-# Animation definitions (the original Office Assistant frame tables).
+# Animation definitions (the original Office Assistant frame tables) and the
+# chat request/response bodies.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.8"
+
+# Speech-balloon UI: egui drawn into the same GL context as the sprite.
+egui = "0.33"
+egui-winit = "0.33"
+egui_glow = "0.33"
+
+# Chat over any OpenAI-compatible server. Blocking client on a worker thread;
+# rustls (the default) gives HTTPS for hosted APIs and plain HTTP for local
+# servers.
+ureq = "3"
 
 # Native right-click menu on Windows and macOS. Linux uses the keyboard
 # (Escape / Q) because winit has no GTK window for a native popup there.

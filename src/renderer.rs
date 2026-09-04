@@ -1,13 +1,19 @@
-//! Draws the current frame into a transparent OpenGL window.
+//! Draws the current Clippy frame into a transparent OpenGL window.
 //!
-//! The window is cleared to transparent black and one textured quad covering
-//! the whole window is drawn with premultiplied-alpha blending, so everything
-//! outside Clippy's outline stays see-through. Nearest-neighbour sampling
-//! keeps the pixel art crisp at any integer scale.
+//! The frame is uploaded to a texture and drawn as one quad. The quad fills
+//! whatever viewport rectangle [`Renderer::draw`] is given, so Clippy can
+//! occupy the whole window or just the bottom of it (with the chat balloon
+//! above). Nearest-neighbour sampling keeps the pixel art crisp, and
+//! premultiplied-alpha blending over a transparent clear keeps the window
+//! see-through around his outline.
+//!
+//! The GL context is shared (as an `Arc`) with egui's painter, so every method
+//! re-establishes the little GL state it needs rather than trusting whatever
+//! egui left behind.
 
 use glow::{HasContext, PixelUnpackData};
-use std::ffi::CStr;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlError(pub String);
@@ -98,134 +104,122 @@ pub fn shader_sources(is_embedded: bool, major: u32, minor: u32) -> (&'static st
 }
 
 pub struct Renderer {
-    gl: glow::Context,
+    gl: Arc<glow::Context>,
     program: glow::Program,
     vertex_array: Option<glow::VertexArray>,
     vertex_buffer: glow::Buffer,
     texture: glow::Texture,
+    position_location: u32,
+    uv_location: u32,
     frame_width: u32,
     frame_height: u32,
 }
 
 impl Renderer {
-    /// Loads OpenGL through `loader` and sets up the pipeline for frames of
-    /// `frame_width` x `frame_height` pixels.
+    /// Sets up the pipeline for frames of `frame_width` x `frame_height` pixels
+    /// on the given shared GL context.
     ///
-    /// # Safety
-    ///
-    /// A GL context must be current on this thread now and whenever any other
+    /// The context must be current on this thread now and whenever any other
     /// method of the returned renderer is called, including its destructor.
-    pub unsafe fn new<F>(loader: F, frame_width: u32, frame_height: u32) -> Result<Self, GlError>
-    where
-        F: FnMut(&CStr) -> *const std::ffi::c_void,
-    {
-        let gl = glow::Context::from_loader_function_cstr(loader);
-        let version = gl.version();
-        let (vertex_source, fragment_source) =
-            shader_sources(version.is_embedded, version.major, version.minor);
-        // Vertex array objects exist from OpenGL 3.0 and OpenGL ES 3.0 on, and
-        // core profiles refuse to draw without one.
-        let needs_vertex_array = version.major >= 3;
+    pub fn new(
+        gl: Arc<glow::Context>,
+        frame_width: u32,
+        frame_height: u32,
+    ) -> Result<Self, GlError> {
+        // SAFETY: the caller guarantees a current context (see the doc comment).
+        unsafe {
+            let version = gl.version();
+            let (vertex_source, fragment_source) =
+                shader_sources(version.is_embedded, version.major, version.minor);
+            // Vertex array objects exist from OpenGL 3.0 / ES 3.0 on, and core
+            // profiles refuse to draw without one.
+            let needs_vertex_array = version.major >= 3;
 
-        let program = link_program(&gl, vertex_source, fragment_source)?;
-        gl.use_program(Some(program));
+            let program = link_program(&gl, vertex_source, fragment_source)?;
+            gl.use_program(Some(program));
 
-        let vertex_array = if needs_vertex_array {
-            let vertex_array = gl.create_vertex_array().map_err(GlError)?;
-            gl.bind_vertex_array(Some(vertex_array));
-            Some(vertex_array)
-        } else {
-            None
-        };
+            let vertex_array = if needs_vertex_array {
+                let vertex_array = gl.create_vertex_array().map_err(GlError)?;
+                gl.bind_vertex_array(Some(vertex_array));
+                Some(vertex_array)
+            } else {
+                None
+            };
 
-        let vertex_buffer = gl.create_buffer().map_err(GlError)?;
-        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertex_buffer));
-        let quad_bytes: Vec<u8> = QUAD.iter().flat_map(|value| value.to_ne_bytes()).collect();
-        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, &quad_bytes, glow::STATIC_DRAW);
+            let vertex_buffer = gl.create_buffer().map_err(GlError)?;
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertex_buffer));
+            let quad_bytes: Vec<u8> = QUAD.iter().flat_map(|value| value.to_ne_bytes()).collect();
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, &quad_bytes, glow::STATIC_DRAW);
 
-        let stride = (4 * std::mem::size_of::<f32>()) as i32;
-        let position = gl
-            .get_attrib_location(program, "a_pos")
-            .ok_or_else(|| GlError("shader has no a_pos attribute".to_string()))?;
-        let uv = gl
-            .get_attrib_location(program, "a_uv")
-            .ok_or_else(|| GlError("shader has no a_uv attribute".to_string()))?;
-        gl.vertex_attrib_pointer_f32(position, 2, glow::FLOAT, false, stride, 0);
-        gl.enable_vertex_attrib_array(position);
-        gl.vertex_attrib_pointer_f32(
-            uv,
-            2,
-            glow::FLOAT,
-            false,
-            stride,
-            (2 * std::mem::size_of::<f32>()) as i32,
-        );
-        gl.enable_vertex_attrib_array(uv);
+            let position_location = gl
+                .get_attrib_location(program, "a_pos")
+                .ok_or_else(|| GlError("shader has no a_pos attribute".to_string()))?;
+            let uv_location = gl
+                .get_attrib_location(program, "a_uv")
+                .ok_or_else(|| GlError("shader has no a_uv attribute".to_string()))?;
 
-        let texture = gl.create_texture().map_err(GlError)?;
-        gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MIN_FILTER,
-            glow::NEAREST as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MAG_FILTER,
-            glow::NEAREST as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_S,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_T,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            glow::RGBA as i32,
-            frame_width as i32,
-            frame_height as i32,
-            0,
-            glow::RGBA,
-            glow::UNSIGNED_BYTE,
-            PixelUnpackData::Slice(None),
-        );
-        let sampler = gl.get_uniform_location(program, "u_tex");
-        gl.uniform_1_i32(sampler.as_ref(), 0);
+            let texture = gl.create_texture().map_err(GlError)?;
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                frame_width as i32,
+                frame_height as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                PixelUnpackData::Slice(None),
+            );
+            let sampler = gl.get_uniform_location(program, "u_tex");
+            gl.uniform_1_i32(sampler.as_ref(), 0);
 
-        gl.disable(glow::DEPTH_TEST);
-        gl.disable(glow::SCISSOR_TEST);
-        gl.enable(glow::BLEND);
-        // Premultiplied alpha: the frame texture is premultiplied and the
-        // cleared background is transparent black.
-        gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-        gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            check_gl_error(&gl, "renderer setup")?;
 
-        check_gl_error(&gl, "renderer setup")?;
-
-        Ok(Self {
-            gl,
-            program,
-            vertex_array,
-            vertex_buffer,
-            texture,
-            frame_width,
-            frame_height,
-        })
+            Ok(Self {
+                gl,
+                program,
+                vertex_array,
+                vertex_buffer,
+                texture,
+                position_location,
+                uv_location,
+                frame_width,
+                frame_height,
+            })
+        }
     }
 
-    /// Matches the viewport to the window's physical size.
-    pub fn resize(&self, width: u32, height: u32) {
+    /// Clears the whole window to transparent, ignoring any scissor egui left
+    /// enabled.
+    pub fn clear(&self) {
         // SAFETY: the caller keeps the context current (see `new`).
         unsafe {
-            self.gl.viewport(0, 0, width as i32, height as i32);
+            self.gl.disable(glow::SCISSOR_TEST);
+            self.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            self.gl.clear(glow::COLOR_BUFFER_BIT);
         }
     }
 
@@ -242,6 +236,7 @@ impl Renderer {
         // SAFETY: the caller keeps the context current (see `new`).
         unsafe {
             self.gl.bind_texture(glow::TEXTURE_2D, Some(self.texture));
+            self.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
             self.gl.tex_sub_image_2d(
                 glow::TEXTURE_2D,
                 0,
@@ -257,17 +252,40 @@ impl Renderer {
         }
     }
 
-    /// Clears to transparent and draws the frame over the whole window.
-    pub fn draw(&self) {
+    /// Draws the frame filling the given viewport rectangle (physical pixels,
+    /// origin at the bottom-left of the window).
+    pub fn draw(&self, x: i32, y: i32, width: i32, height: i32) {
         // SAFETY: the caller keeps the context current (see `new`).
         unsafe {
-            self.gl.clear(glow::COLOR_BUFFER_BIT);
+            self.gl.disable(glow::SCISSOR_TEST);
+            self.gl.enable(glow::BLEND);
+            self.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+            self.gl.viewport(x, y, width, height);
             self.gl.use_program(Some(self.program));
             if let Some(vertex_array) = self.vertex_array {
                 self.gl.bind_vertex_array(Some(vertex_array));
             }
             self.gl
                 .bind_buffer(glow::ARRAY_BUFFER, Some(self.vertex_buffer));
+            let stride = 4 * std::mem::size_of::<f32>() as i32;
+            self.gl.vertex_attrib_pointer_f32(
+                self.position_location,
+                2,
+                glow::FLOAT,
+                false,
+                stride,
+                0,
+            );
+            self.gl.enable_vertex_attrib_array(self.position_location);
+            self.gl.vertex_attrib_pointer_f32(
+                self.uv_location,
+                2,
+                glow::FLOAT,
+                false,
+                stride,
+                2 * std::mem::size_of::<f32>() as i32,
+            );
+            self.gl.enable_vertex_attrib_array(self.uv_location);
             self.gl.active_texture(glow::TEXTURE0);
             self.gl.bind_texture(glow::TEXTURE_2D, Some(self.texture));
             self.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);

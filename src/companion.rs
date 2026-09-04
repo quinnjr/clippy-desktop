@@ -31,6 +31,8 @@ enum Mode {
     Idle,
     /// Playing a gesture (the greeting or a reaction to a poke).
     Gesture,
+    /// Looping a fixed animation until released (e.g. thinking during a chat).
+    Busy,
     /// Wrapping up an animation so it (and any queued gesture) can end.
     Exiting { deadline: Instant },
 }
@@ -48,6 +50,8 @@ pub struct Companion {
     mode: Mode,
     /// When the current idle/gesture should be asked to wrap up.
     play_until: Instant,
+    /// The animation looped while [`Mode::Busy`].
+    busy_name: Option<String>,
     pending: Option<String>,
     last_idle: Option<String>,
     last_gesture: Option<String>,
@@ -75,6 +79,7 @@ impl Companion {
             rng,
             mode: Mode::Resting { until: now },
             play_until: now,
+            busy_name: None,
             pending: None,
             last_idle: None,
             last_gesture: None,
@@ -126,6 +131,7 @@ impl Companion {
                 Some(step) => step.min(deadline),
                 None => deadline,
             }),
+            Mode::Busy => Some(self.animator.next_deadline().unwrap_or(self.play_until)),
         }
     }
 
@@ -157,6 +163,15 @@ impl Companion {
                     self.finish(now);
                 }
             }
+            Mode::Busy => {
+                // Loop the busy animation: replay it whenever it finishes, so
+                // even a self-terminating one keeps going until released.
+                if self.animator.advance(&self.agent, now, &mut self.rng) == StepEvent::Exited {
+                    if let Some(name) = self.busy_name.clone() {
+                        let _ = self.animator.play(&self.agent, &name, now, &mut self.rng);
+                    }
+                }
+            }
         }
         self.frame_key() != before
     }
@@ -183,7 +198,38 @@ impl Companion {
                     self.pending = Some(gesture);
                 }
             }
+            // While thinking during a chat, Clippy ignores pokes.
+            Mode::Busy => {}
         }
+    }
+
+    /// Plays one specific animation now, as a one-off reaction (used when a
+    /// chat reply arrives). Interrupts whatever Clippy was doing.
+    pub fn perform(&mut self, name: &str, now: Instant) {
+        self.busy_name = None;
+        self.pending = None;
+        self.play(name, Mode::Gesture, now);
+    }
+
+    /// Loops `name` until [`release`](Self::release) is called (Clippy's
+    /// "thinking" pose while a chat reply is on its way).
+    pub fn hold_animation(&mut self, name: &str, now: Instant) {
+        // An unknown animation leaves Clippy as he was.
+        if self
+            .animator
+            .play(&self.agent, name, now, &mut self.rng)
+            .is_ok()
+        {
+            self.busy_name = Some(name.to_string());
+            self.pending = None;
+            self.mode = Mode::Busy;
+        }
+    }
+
+    /// Leaves the busy loop and goes back to resting.
+    pub fn release(&mut self, now: Instant) {
+        self.busy_name = None;
+        self.rest(now);
     }
 
     /// The current animation ended: play what is queued, or rest.

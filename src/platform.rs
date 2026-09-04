@@ -10,6 +10,8 @@ use winit::window::Window;
 pub enum MenuAction {
     /// "Animate!": play a random gesture.
     Animate,
+    /// "Ask Clippy…": open the chat balloon.
+    Chat,
     Quit,
 }
 

@@ -14,8 +14,10 @@ runs on Windows, macOS and Linux (X11 and Wayland).
 - **He fidgets**: greets you on startup, then plays his idle animations at
   random intervals, exactly the way the original player sequenced them
   (frame durations, weighted random branching, exit branches).
-- **He reacts**: click him, press Space or Enter, or pick *Animate!* from the
-  right-click menu and he does one of his 30 gestures.
+- **He reacts**: click him or press Space and he does one of his 30 gestures.
+- **Ask him things**: press Enter for a speech balloon with a prompt box. He
+  talks to any OpenAI-compatible server and streams the reply into the
+  balloon, thinking and writing while it arrives. See [Chat](#chat).
 - **Drag him anywhere** with the left mouse button.
 - **Real transparency everywhere**: rendering goes through OpenGL with an
   alpha-capable framebuffer, so only Clippy's outline is visible on
@@ -53,6 +55,9 @@ system allows applications to place windows; see the Wayland note below).
 ```
 --scale <N>          Size multiplier for the sprite, 1 to 8 (default: 2)
 --no-always-on-top   Let other windows cover Clippy
+--base-url <URL>     OpenAI-compatible server, e.g. http://localhost:11434/v1
+--model <NAME>       Model to chat with, e.g. llama3.2 or gpt-4o-mini
+--api-key <KEY>      Bearer token, if the server needs one
 -h, --help           Print the options
 -V, --version        Print the version
 ```
@@ -62,15 +67,45 @@ logical pixels, and it follows your display scaling.
 
 ### Controls
 
-| Action                          | Effect                              |
-| ------------------------------- | ----------------------------------- |
-| Drag with the left mouse button | Move Clippy                         |
-| Left click, Space or Enter      | Clippy does something               |
-| Right click                     | Menu: *Animate!* / *Quit* (Windows, macOS) |
-| Escape or Q                     | Quit                                |
+| Action                          | Effect                                        |
+| ------------------------------- | --------------------------------------------- |
+| Drag with the left mouse button | Move Clippy                                   |
+| Left click or Space             | Clippy does something                         |
+| Enter                           | Open the chat balloon and ask him             |
+| Right click                     | Menu: *Ask Clippy…* / *Animate!* / *Quit* (Windows, macOS); opens the chat on Linux |
+| Escape                          | Close the balloon, or quit                    |
+| Q                               | Quit                                          |
 
 Closing the window through the system (Alt+F4, Cmd+Q, the window manager's
 close action) also quits.
+
+## Chat
+
+Press **Enter** and a speech balloon opens above Clippy with a prompt box.
+Type a question, press Enter (or click **Send**), and his reply streams into
+the balloon while he thinks and writes. Escape closes the balloon.
+
+Chat works with any server that speaks the OpenAI `/chat/completions` API —
+[Ollama](https://ollama.com), LM Studio, llama.cpp's server, vLLM, LiteLLM,
+OpenAI itself, and so on. Point Clippy at one with flags or the environment
+(flags win):
+
+```bash
+# A local server (no key needed)
+clippy-app --base-url http://localhost:11434/v1 --model llama3.2
+
+# OpenAI
+OPENAI_BASE_URL=https://api.openai.com/v1 \
+OPENAI_MODEL=gpt-4o-mini \
+OPENAI_API_KEY=sk-... \
+clippy-app
+```
+
+The environment variables are `OPENAI_BASE_URL`, `OPENAI_MODEL` and
+`OPENAI_API_KEY`. Until a base URL and a model are set, chat stays disabled and
+the balloon says how to turn it on — Clippy still keeps you company. Requests
+stream on a background thread, so the animation never stalls while he waits for
+an answer, and closing the balloon or asking again cancels a reply in flight.
 
 ## Platform notes
 
@@ -80,8 +115,8 @@ close action) also quits.
   get placement and always-on-top back, run him through XWayland:
   `WAYLAND_DISPLAY= ./target/release/clippy-app`.
 - **Linux**: there is no native right-click menu (the window has no GTK
-  counterpart), so right-clicking makes Clippy do something instead. Quit
-  with Escape or Q.
+  counterpart), so right-clicking opens the chat balloon instead. Quit with
+  Escape (when the balloon is closed) or Q.
 - **X11**: transparency needs a compositing window manager, which every
   current desktop environment provides.
 - **Windows**: release builds are GUI programs, so nothing is printed to a
@@ -101,6 +136,11 @@ close action) also quits.
 - `assets/clippy/map.png` is the sprite sheet: 902 cells of 124 by 93
   pixels with a transparent background.
 - Native menus on Windows and macOS come from `muda`.
+- The chat balloon is `egui`, drawn by `egui_glow` into the same GL context as
+  Clippy (they share one `glow` context), so it stays part of the one
+  see-through window and follows him when dragged. `src/chat/` builds the
+  request and streams the reply with `ureq` on a worker thread, parsing the
+  Server-Sent Events; tokens reach the UI through the winit event loop.
 
 The software renderer used by the first version of this project (`softbuffer`)
 was replaced because its Wayland backend has no alpha channel.
@@ -113,8 +153,11 @@ cargo test
 
 The tests cover the animation data (every frame and branch index it refers
 to exists), the player's stepping rules, Clippy's behaviour over a simulated
-45-minute session, sprite compositing and premultiplication, and the
-command line. The window and OpenGL code is exercised by running the app.
+45-minute session, sprite compositing and premultiplication, the command
+line, and the chat subsystem — the SSE parser, configuration resolution,
+conversation state, and the streaming client run end to end against an
+in-process mock server. The window and OpenGL code is exercised by running
+the app.
 
 ## Credits and licensing
 

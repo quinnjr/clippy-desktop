@@ -1,16 +1,20 @@
-//! The window, its OpenGL surface, and the event loop.
+//! The window, its OpenGL surface, the chat balloon, and the event loop.
 //!
-//! The window is borderless, transparent and (by default) always on top. It is
-//! created through `glutin-winit` so that, on X11, it gets the 32-bit visual of
-//! the alpha-capable OpenGL config; on Wayland, Windows and macOS the OpenGL
-//! surface carries the alpha channel itself.
+//! The window is borderless, transparent and (by default) always on top. When
+//! the chat balloon is closed it is exactly Clippy's size; when it opens, the
+//! window grows upward to hold the balloon above him and shrinks again when it
+//! closes. Clippy is drawn by the sprite renderer into the bottom of the
+//! window; the balloon is drawn by egui over the top, both on the same GL
+//! context so the whole thing stays a single see-through window.
 
 use crate::agent::Agent;
+use crate::chat::{self, ChatEvent, ChatState, Status};
 use crate::companion::Companion;
 use crate::options::Options;
 use crate::platform::{self, ContextMenuHandle, MenuAction};
 use crate::renderer::Renderer;
 use crate::sprite::SpriteSheet;
+use crate::ui::{self, BalloonAction, BalloonLayout};
 use glutin::config::{Config, ConfigTemplateBuilder, GetGlConfig};
 use glutin::context::{
     ContextApi, ContextAttributesBuilder, NotCurrentContext, PossiblyCurrentContext, Version,
@@ -21,12 +25,13 @@ use glutin::surface::{Surface, SwapInterval, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
 use std::error::Error;
 use std::num::NonZeroU32;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
@@ -37,9 +42,26 @@ const DRAG_THRESHOLD: f64 = 4.0;
 const MARGIN_RIGHT: f64 = 48.0;
 const MARGIN_BOTTOM: f64 = 96.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Balloon geometry, in logical pixels (egui points).
+const BALLOON_W: f64 = 340.0;
+const BALLOON_H: f64 = 250.0;
+const TAIL: f64 = 18.0;
+const BALLOON_PAD: f32 = 4.0;
+
+/// Frame budget while the balloon is open, so the caret blinks and streamed
+/// text appears promptly without spinning the CPU.
+const OPEN_FRAME: Duration = Duration::from_millis(33);
+
+/// Animations Clippy plays around a chat.
+const THINKING: &str = "Thinking";
+const WRITING: &str = "Writing";
+const ANSWERED: &str = "GetAttention";
+const FAILED: &str = "Alert";
+
+#[derive(Debug, Clone)]
 pub enum UserEvent {
     Menu(MenuAction),
+    Chat { generation: u64, event: ChatEvent },
 }
 
 /// Runs Clippy until the user quits.
@@ -48,18 +70,29 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let sheet = SpriteSheet::clippy();
     agent.validate(sheet.width(), sheet.height())?;
 
+    let chat_config = chat::resolve(&options.chat);
+    if let Err(unconfigured) = &chat_config {
+        eprintln!(
+            "clippy-app: {}",
+            unconfigured.message.replace('\n', "\nclippy-app: ")
+        );
+        eprintln!("clippy-app: (Clippy will still keep you company.)");
+    }
+
     #[cfg(target_os = "linux")]
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         eprintln!(
-            "Wayland session: the compositor decides where Clippy appears and whether he stays on top. \
-             Drag him to move him; press Escape or Q to quit."
+            "clippy-app: Wayland session; the compositor places Clippy and decides stacking. \
+             Drag him to move him."
         );
     }
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
-    let proxy = Mutex::new(event_loop.create_proxy());
+    let proxy = event_loop.create_proxy();
+
+    let menu_proxy = Mutex::new(proxy.clone());
     platform::install_menu_event_handler(move |action| {
-        if let Ok(proxy) = proxy.lock() {
+        if let Ok(proxy) = menu_proxy.lock() {
             let _ = proxy.send_event(UserEvent::Menu(action));
         }
     });
@@ -71,7 +104,7 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let mut app = App::new(options, agent, sheet, menu);
+    let mut app = App::new(options, agent, sheet, menu, chat_config, proxy);
     event_loop.run_app(&mut app)?;
     app.exit_state
 }
@@ -84,6 +117,7 @@ enum DisplayState {
 struct WindowState {
     surface: Surface<WindowSurface>,
     renderer: Renderer,
+    egui_painter: egui_glow::Painter,
     /// Declared last: everything above borrows the window's native handle.
     window: Window,
 }
@@ -98,12 +132,23 @@ struct App {
     /// Declared before `gl_context`: the surface and GL objects need the context alive.
     state: Option<WindowState>,
     gl_context: Option<PossiblyCurrentContext>,
+    egui_ctx: egui::Context,
+    egui_state: Option<egui_winit::State>,
     frame_pixels: Vec<u8>,
     /// Frame currently in the texture.
     uploaded: Option<(String, usize)>,
     cursor: PhysicalPosition<f64>,
     /// Where the left button went down, until it becomes a drag or a click.
     press: Option<PhysicalPosition<f64>>,
+    chat: ChatState,
+    balloon_open: bool,
+    balloon_input: String,
+    balloon_focus: bool,
+    proxy: EventLoopProxy<UserEvent>,
+    /// Bumped for each request so late events from an old one are ignored.
+    generation: u64,
+    /// Cancels the in-flight request's worker thread.
+    cancel: Arc<AtomicBool>,
     exit_state: Result<(), Box<dyn Error>>,
 }
 
@@ -113,14 +158,17 @@ impl App {
         agent: Agent,
         sheet: SpriteSheet,
         menu: Option<ContextMenuHandle>,
+        chat_config: Result<chat::ChatConfig, chat::Unconfigured>,
+        proxy: EventLoopProxy<UserEvent>,
     ) -> Self {
         // Ask for an alpha channel everywhere. Only macOS needs the explicit
-        // transparency flag (it can only report one config at a time); the
-        // other platforms return several configs and `pick_config` prefers
-        // the transparent one.
+        // transparency flag; the other platforms return several configs and
+        // `pick_config` prefers the transparent one.
         let template = ConfigTemplateBuilder::new()
             .with_alpha_size(8)
             .with_transparency(cfg!(target_os = "macos"));
+        let egui_ctx = egui::Context::default();
+        egui_ctx.set_visuals(egui::Visuals::light());
         Self {
             options,
             sheet,
@@ -130,10 +178,19 @@ impl App {
             display: DisplayState::Pending(Box::new(DisplayBuilder::new())),
             state: None,
             gl_context: None,
+            egui_ctx,
+            egui_state: None,
             frame_pixels: Vec::new(),
             uploaded: None,
             cursor: PhysicalPosition::new(0.0, 0.0),
             press: None,
+            chat: ChatState::new(chat_config),
+            balloon_open: false,
+            balloon_input: String::new(),
+            balloon_focus: false,
+            proxy,
+            generation: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
             exit_state: Ok(()),
         }
     }
@@ -143,10 +200,25 @@ impl App {
         event_loop.exit();
     }
 
+    /// Clippy's on-screen size, in logical pixels.
+    fn clippy_logical(&self) -> (f64, f64) {
+        let (fw, fh) = self.companion.agent().frame_size();
+        let scale = self.options.scale as f64;
+        (fw as f64 * scale, fh as f64 * scale)
+    }
+
+    /// The window's logical size for the current balloon state.
+    fn window_logical(&self) -> LogicalSize<f64> {
+        let (clw, clh) = self.clippy_logical();
+        if self.balloon_open {
+            LogicalSize::new(clw.max(BALLOON_W), BALLOON_H + TAIL + clh)
+        } else {
+            LogicalSize::new(clw, clh)
+        }
+    }
+
     fn window_attributes(&self, event_loop: &ActiveEventLoop) -> WindowAttributes {
-        let (frame_width, frame_height) = self.companion.agent().frame_size();
-        let scale = self.options.scale;
-        let logical = LogicalSize::new((frame_width * scale) as f64, (frame_height * scale) as f64);
+        let logical = self.window_logical();
         let level = if self.options.always_on_top {
             WindowLevel::AlwaysOnTop
         } else {
@@ -176,41 +248,33 @@ impl App {
         self.request_redraw();
     }
 
-    fn redraw(&mut self) {
-        let Some(state) = self.state.as_ref() else {
+    /// Opens or closes the balloon, resizing the window and keeping Clippy
+    /// anchored where he is.
+    fn set_balloon(&mut self, open: bool) {
+        if self.balloon_open == open {
+            return;
+        }
+        self.balloon_open = open;
+        if open {
+            self.balloon_focus = true;
+        }
+        let Some(state) = &self.state else {
             return;
         };
-        let Some(gl_context) = self.gl_context.as_ref() else {
-            return;
-        };
-        let key = self.companion.frame_key();
-        if key != self.uploaded {
-            let (frame_width, frame_height) = self.companion.agent().frame_size();
-            let cells: &[[u32; 2]] = self
-                .companion
-                .frame()
-                .map(|frame| frame.images.as_slice())
-                .unwrap_or(&[]);
-            self.sheet
-                .compose(cells, frame_width, frame_height, &mut self.frame_pixels);
-            match state.renderer.upload(&self.frame_pixels) {
-                Ok(()) => self.uploaded = key,
-                Err(err) => eprintln!("clippy-app: {err}"),
-            }
-        }
-        state.renderer.draw();
-        state.window.pre_present_notify();
-        if let Err(err) = state.surface.swap_buffers(gl_context) {
-            eprintln!("clippy-app: could not present the frame: {err}");
-        }
-    }
-
-    fn start_drag(&mut self) {
-        self.press = None;
-        if let Some(state) = &self.state {
-            // Unsupported on some setups; a failed drag is not an error worth reporting.
-            let _ = state.window.drag_window();
-        }
+        let scale_factor = state.window.scale_factor();
+        let old = state.window.inner_size();
+        let old_pos = state.window.outer_position().unwrap_or_default();
+        let new_logical = self.window_logical();
+        let new_w = (new_logical.width * scale_factor).round() as i32;
+        let new_h = (new_logical.height * scale_factor).round() as i32;
+        let clippy_center_x = old_pos.x + old.width as i32 / 2;
+        let clippy_bottom = old_pos.y + old.height as i32;
+        let _ = state.window.request_inner_size(new_logical);
+        state.window.set_outer_position(PhysicalPosition::new(
+            clippy_center_x - new_w / 2,
+            clippy_bottom - new_h,
+        ));
+        state.window.request_redraw();
     }
 
     fn right_click(&mut self) {
@@ -220,7 +284,151 @@ impl App {
                 return;
             }
         }
-        self.poke();
+        // No native menu (Linux): right-click opens the chat instead.
+        self.set_balloon(true);
+    }
+
+    /// Sends a prompt to the server on a worker thread, and sets Clippy thinking.
+    fn submit_prompt(&mut self, text: String) {
+        let Some(config) = self.chat.config().cloned() else {
+            self.balloon_focus = true;
+            self.request_redraw();
+            return;
+        };
+        // Retire any in-flight request.
+        self.cancel.store(true, Ordering::Relaxed);
+        self.generation += 1;
+        let generation = self.generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = cancel.clone();
+
+        let messages = self.chat.begin_user(&text);
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            chat::stream(&config, &messages, &cancel, |event| {
+                let _ = proxy.send_event(UserEvent::Chat { generation, event });
+            });
+        });
+
+        self.companion.hold_animation(THINKING, Instant::now());
+        self.request_redraw();
+    }
+
+    fn on_chat_event(&mut self, event: ChatEvent) {
+        let now = Instant::now();
+        match event {
+            ChatEvent::Delta(text) => {
+                let was_waiting = matches!(self.chat.status(), Status::Waiting);
+                self.chat.on_delta(&text);
+                if was_waiting {
+                    self.companion.hold_animation(WRITING, now);
+                }
+            }
+            ChatEvent::Done => {
+                self.chat.on_done();
+                self.companion.release(now);
+                self.companion.perform(ANSWERED, now);
+            }
+            ChatEvent::Error(message) => {
+                self.chat.on_error(message);
+                self.companion.release(now);
+                self.companion.perform(FAILED, now);
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn redraw(&mut self) {
+        if self.gl_context.is_none() {
+            return;
+        }
+        let balloon_open = self.balloon_open;
+        let (clw, clh) = self.clippy_logical();
+        let mut action = BalloonAction::None;
+
+        {
+            let Some(state) = self.state.as_mut() else {
+                return;
+            };
+            let gl_context = self.gl_context.as_ref().expect("checked above");
+            let WindowState {
+                surface,
+                renderer,
+                egui_painter,
+                window,
+            } = state;
+
+            // Upload the current sprite frame if it changed.
+            let key = self.companion.frame_key();
+            if key != self.uploaded {
+                let (fw, fh) = self.companion.agent().frame_size();
+                let cells: &[[u32; 2]] = self
+                    .companion
+                    .frame()
+                    .map(|frame| frame.images.as_slice())
+                    .unwrap_or(&[]);
+                self.sheet.compose(cells, fw, fh, &mut self.frame_pixels);
+                match renderer.upload(&self.frame_pixels) {
+                    Ok(()) => self.uploaded = key,
+                    Err(err) => eprintln!("clippy-app: {err}"),
+                }
+            }
+
+            let inner = window.inner_size();
+            let scale_factor = window.scale_factor() as f32;
+
+            renderer.clear();
+            // Clippy fills the window when closed, or its bottom-centre when open.
+            let (clippy_w, clippy_h, x0) = if balloon_open {
+                let cw = (clw as f32 * scale_factor).round() as i32;
+                let ch = (clh as f32 * scale_factor).round() as i32;
+                (cw, ch, (inner.width as i32 - cw) / 2)
+            } else {
+                (inner.width as i32, inner.height as i32, 0)
+            };
+            renderer.draw(x0, 0, clippy_w, clippy_h);
+
+            if balloon_open {
+                let egui_ctx = self.egui_ctx.clone();
+                let egui_state = self.egui_state.as_mut().expect("created with the window");
+                let raw_input = egui_state.take_egui_input(window);
+                let layout = balloon_layout(inner, scale_factor, clh as f32);
+
+                let chat = &self.chat;
+                let input = &mut self.balloon_input;
+                let focus = &mut self.balloon_focus;
+                let full = egui_ctx.run(raw_input, |ctx| {
+                    action = ui::show(ctx, &layout, chat, input, focus);
+                });
+                egui_state.handle_platform_output(window, full.platform_output);
+                let primitives = egui_ctx.tessellate(full.shapes, full.pixels_per_point);
+                egui_painter.paint_and_update_textures(
+                    [inner.width, inner.height],
+                    full.pixels_per_point,
+                    &primitives,
+                    &full.textures_delta,
+                );
+            }
+
+            window.pre_present_notify();
+            if let Err(err) = surface.swap_buffers(gl_context) {
+                eprintln!("clippy-app: could not present the frame: {err}");
+            }
+        }
+
+        match action {
+            BalloonAction::Submit(text) => self.submit_prompt(text),
+            BalloonAction::Close => self.set_balloon(false),
+            BalloonAction::None => {}
+        }
+    }
+
+    fn start_drag(&mut self) {
+        self.press = None;
+        if let Some(state) = &self.state {
+            // Unsupported on some setups; a failed drag is not worth reporting.
+            let _ = state.window.drag_window();
+        }
     }
 }
 
@@ -280,30 +488,40 @@ impl ApplicationHandler<UserEvent> for App {
             return self.fail(event_loop, err.into());
         }
 
+        // Load GL once and share it between the sprite renderer and egui.
+        let gl = Arc::new(unsafe {
+            glow::Context::from_loader_function_cstr(|symbol| gl_display.get_proc_address(symbol))
+        });
+
         let (frame_width, frame_height) = self.companion.agent().frame_size();
-        // SAFETY: the context was made current just above and stays current
-        // for the life of the window; the renderer is dropped before it.
-        let renderer = match unsafe {
-            Renderer::new(
-                |symbol| gl_display.get_proc_address(symbol),
-                frame_width,
-                frame_height,
-            )
-        } {
+        let renderer = match Renderer::new(gl.clone(), frame_width, frame_height) {
             Ok(renderer) => renderer,
             Err(err) => return self.fail(event_loop, err.into()),
         };
+        let egui_painter = match egui_glow::Painter::new(gl, "", None, false) {
+            Ok(painter) => painter,
+            Err(err) => return self.fail(event_loop, format!("egui painter: {err}").into()),
+        };
+        let egui_state = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            Some(egui_painter.max_texture_side()),
+        );
+
         if let Err(err) = surface.set_swap_interval(gl_context, SwapInterval::Wait(NonZeroU32::MIN))
         {
             eprintln!("clippy-app: could not enable vsync: {err}");
         }
-        let size = window.inner_size();
-        renderer.resize(size.width, size.height);
 
         self.uploaded = None;
+        self.egui_state = Some(egui_state);
         self.state = Some(WindowState {
             surface,
             renderer,
+            egui_painter,
             window,
         });
         self.redraw();
@@ -315,6 +533,21 @@ impl ApplicationHandler<UserEvent> for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Feed egui first while the balloon is open.
+        let consumed = if let (true, Some(egui_state), Some(state)) = (
+            self.balloon_open,
+            self.egui_state.as_mut(),
+            self.state.as_ref(),
+        ) {
+            let response = egui_state.on_window_event(&state.window, &event);
+            if response.repaint {
+                state.window.request_redraw();
+            }
+            response.consumed
+        } else {
+            false
+        };
+
         match event {
             WindowEvent::Resized(size) if size.width != 0 && size.height != 0 => {
                 if let (Some(state), Some(gl_context)) = (&self.state, &self.gl_context) {
@@ -323,56 +556,29 @@ impl ApplicationHandler<UserEvent> for App {
                         NonZeroU32::new(size.width).expect("checked above"),
                         NonZeroU32::new(size.height).expect("checked above"),
                     );
-                    state.renderer.resize(size.width, size.height);
                     state.window.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        logical_key,
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } => match logical_key {
-                Key::Named(NamedKey::Escape) => event_loop.exit(),
-                Key::Character(text) if text.eq_ignore_ascii_case("q") => event_loop.exit(),
-                Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter) => self.poke(),
-                _ => {}
-            },
+            WindowEvent::KeyboardInput { event, .. } if !consumed => {
+                self.on_key(event_loop, event);
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
-                if let Some(press) = self.press {
-                    let dx = position.x - press.x;
-                    let dy = position.y - press.y;
-                    if (dx * dx + dy * dy).sqrt() >= DRAG_THRESHOLD {
-                        self.start_drag();
+                if !consumed {
+                    if let Some(press) = self.press {
+                        let dx = position.x - press.x;
+                        let dy = position.y - press.y;
+                        if (dx * dx + dy * dy).sqrt() >= DRAG_THRESHOLD {
+                            self.start_drag();
+                        }
                     }
                 }
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => self.press = Some(self.cursor),
-            WindowEvent::MouseInput {
-                state: ElementState::Released,
-                button: MouseButton::Left,
-                ..
-            } => {
-                if self.press.take().is_some() {
-                    self.poke();
-                }
+            WindowEvent::MouseInput { state, button, .. } if !consumed => {
+                self.on_mouse(state, button);
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Released,
-                button: MouseButton::Right,
-                ..
-            } => self.right_click(),
             _ => {}
         }
     }
@@ -380,7 +586,13 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Menu(MenuAction::Animate) => self.poke(),
+            UserEvent::Menu(MenuAction::Chat) => self.set_balloon(true),
             UserEvent::Menu(MenuAction::Quit) => event_loop.exit(),
+            UserEvent::Chat { generation, event } if generation == self.generation => {
+                self.on_chat_event(event)
+            }
+            // A late event from a retired request.
+            UserEvent::Chat { .. } => {}
         }
     }
 
@@ -391,7 +603,12 @@ impl ApplicationHandler<UserEvent> for App {
         if self.companion.advance(Instant::now()) {
             self.request_redraw();
         }
-        let flow = match self.companion.next_deadline() {
+        let mut deadline = self.companion.next_deadline();
+        if self.balloon_open {
+            let soon = Instant::now() + OPEN_FRAME;
+            deadline = Some(deadline.map_or(soon, |existing| existing.min(soon)));
+        }
+        let flow = match deadline {
             Some(deadline) => ControlFlow::WaitUntil(deadline),
             None => ControlFlow::Wait,
         };
@@ -399,16 +616,20 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.cancel.store(true, Ordering::Relaxed);
         // GL objects and the surface go first, while the context is current.
-        self.state = None;
+        if let Some(mut state) = self.state.take() {
+            state.egui_painter.destroy();
+        }
+        self.egui_state = None;
         if let Some(gl_context) = self.gl_context.take() {
             let gl_display = gl_context.display();
             drop(gl_context);
-            // The NVIDIA driver crashes if the Wayland connection is closed
-            // before the EGL display, so terminate the display explicitly.
+            // The NVIDIA driver crashes if the Wayland connection closes before
+            // the EGL display, so terminate the display explicitly.
             #[cfg(all(any(windows, unix), not(any(target_os = "macos", target_os = "ios"))))]
             if let glutin::display::Display::Egl(egl_display) = gl_display {
-                // SAFETY: every context and surface created from this display was dropped above.
+                // SAFETY: every context and surface from this display was dropped above.
                 unsafe { egl_display.terminate() };
             }
             #[cfg(not(all(
@@ -417,6 +638,60 @@ impl ApplicationHandler<UserEvent> for App {
             )))]
             drop(gl_display);
         }
+    }
+}
+
+impl App {
+    fn on_key(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
+        if event.state != ElementState::Pressed || event.repeat {
+            return;
+        }
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                if self.balloon_open {
+                    self.set_balloon(false);
+                } else {
+                    event_loop.exit();
+                }
+            }
+            Key::Named(NamedKey::Enter) if !self.balloon_open => self.set_balloon(true),
+            Key::Named(NamedKey::Space) if !self.balloon_open => self.poke(),
+            Key::Character(text) if !self.balloon_open && text.eq_ignore_ascii_case("q") => {
+                event_loop.exit()
+            }
+            _ => {}
+        }
+    }
+
+    fn on_mouse(&mut self, state: ElementState, button: MouseButton) {
+        match (state, button) {
+            (ElementState::Pressed, MouseButton::Left) => self.press = Some(self.cursor),
+            (ElementState::Released, MouseButton::Left) => {
+                if self.press.take().is_some() {
+                    self.poke();
+                }
+            }
+            (ElementState::Released, MouseButton::Right) => self.right_click(),
+            _ => {}
+        }
+    }
+}
+
+/// Places the balloon in the top of the window, its tail pointing at Clippy's
+/// centre. All values in egui points (== logical pixels).
+fn balloon_layout(
+    inner: PhysicalSize<u32>,
+    scale_factor: f32,
+    clippy_logical_h: f32,
+) -> BalloonLayout {
+    let win_w = inner.width as f32 / scale_factor;
+    let win_h = inner.height as f32 / scale_factor;
+    let body_h = (win_h - clippy_logical_h - TAIL as f32 - BALLOON_PAD).max(48.0);
+    BalloonLayout {
+        pos: egui::pos2(BALLOON_PAD, BALLOON_PAD),
+        size: egui::vec2(win_w - 2.0 * BALLOON_PAD, body_h),
+        tail_x: win_w / 2.0,
+        tail_y: BALLOON_PAD + body_h,
     }
 }
 
@@ -444,8 +719,7 @@ fn initial_position(
     ))
 }
 
-/// Prefers a config with real transparency, then the one with the fewest
-/// multisample buffers (pixel art needs none).
+/// Prefers a config with real transparency, then the fewest multisample buffers.
 fn pick_config(configs: Box<dyn Iterator<Item = Config> + '_>) -> Config {
     configs
         .reduce(|best, candidate| {

@@ -8,10 +8,12 @@
 pub mod agent;
 pub mod animator;
 pub mod app;
+pub mod chat;
 pub mod companion;
 pub mod options;
 pub mod platform;
 pub mod renderer;
 pub mod sprite;
+pub mod ui;
 
 pub use app::run;
