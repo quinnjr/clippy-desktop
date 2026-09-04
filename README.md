@@ -18,6 +18,9 @@ runs on Windows, macOS and Linux (X11 and Wayland).
 - **Ask him things**: press Enter for a speech balloon with a prompt box. He
   talks to any OpenAI-compatible server and streams the reply into the
   balloon, thinking and writing while it arrives. See [Chat](#chat).
+- **Settings modal**: press F2 (or the balloon's *Settings* button) to set the
+  server, model, key, size, and always-on-top while he's running. Changes save
+  to a config file. See [Settings](#settings).
 - **Drag him anywhere** with the left mouse button.
 - **Real transparency everywhere**: rendering goes through OpenGL with an
   alpha-capable framebuffer, so only Clippy's outline is visible on
@@ -72,8 +75,10 @@ logical pixels, and it follows your display scaling.
 | Drag with the left mouse button | Move Clippy                                   |
 | Left click or Space             | Clippy does something                         |
 | Enter                           | Open the chat balloon and ask him             |
-| Right click                     | Menu: *Ask Clippy…* / *Animate!* / *Quit* (Windows, macOS); opens the chat on Linux |
-| Escape                          | Close the balloon, or quit                    |
+| F2                              | Open the settings modal                       |
+| Right click                     | Menu: *Ask Clippy…* / *Settings…* / *Animate!* / *Quit* (Windows, macOS); opens the chat on Linux |
+| Escape                          | Close the balloon/settings, or quit           |
+| Home                            | Bring Clippy back to the corner               |
 | Q                               | Quit                                          |
 
 Closing the window through the system (Alt+F4, Cmd+Q, the window manager's
@@ -103,9 +108,42 @@ clippy-app
 
 The environment variables are `OPENAI_BASE_URL`, `OPENAI_MODEL` and
 `OPENAI_API_KEY`. Until a base URL and a model are set, chat stays disabled and
-the balloon says how to turn it on — Clippy still keeps you company. Requests
-stream on a background thread, so the animation never stalls while he waits for
-an answer, and closing the balloon or asking again cancels a reply in flight.
+the balloon (and the settings modal) say how to turn it on — Clippy still keeps
+you company. Requests stream on a background thread, so the animation never
+stalls while he waits for an answer, and closing the balloon or asking again
+cancels a reply in flight.
+
+Rather than remember flags, use the settings modal below.
+
+## Settings
+
+Press **F2** (or the balloon's *Settings* button, or *Settings…* in the
+right-click menu on Windows and macOS) to open a modal where you can set the
+chat server, model, and key, the sprite size, and always-on-top while Clippy is
+running. **Save** applies the changes immediately — chat turns on without a
+restart — and writes them to a config file:
+
+- **Linux**: `~/.config/clippy-app/config.toml` (or `$XDG_CONFIG_HOME`)
+- **macOS**: `~/Library/Application Support/clippy-app/config.toml`
+- **Windows**: `%APPDATA%\clippy-app\config.toml`
+
+The file is TOML and hand-editable:
+
+```toml
+scale = 3
+always_on_top = true
+
+[chat]
+base_url = "http://localhost:11434/v1"
+model = "llama3.2"
+# api_key = "sk-..."   # stored in plain text; omitted when empty
+```
+
+Settings resolve in this order, highest priority first: **command-line flags →
+`OPENAI_*` environment variables → config file → built-in defaults**. So a flag
+or env var you pass at launch always wins over the saved file, and the file
+wins over the defaults. A missing or malformed file is ignored (Clippy just
+uses the defaults and says so on stderr).
 
 ## Platform notes
 
@@ -136,11 +174,14 @@ an answer, and closing the balloon or asking again cancels a reply in flight.
 - `assets/clippy/map.png` is the sprite sheet: 902 cells of 124 by 93
   pixels with a transparent background.
 - Native menus on Windows and macOS come from `muda`.
-- The chat balloon is `egui`, drawn by `egui_glow` into the same GL context as
-  Clippy (they share one `glow` context), so it stays part of the one
-  see-through window and follows him when dragged. `src/chat/` builds the
-  request and streams the reply with `ureq` on a worker thread, parsing the
+- The chat balloon and the settings modal are `egui`, drawn by `egui_glow`
+  into the same GL context as Clippy (they share one `glow` context), so they
+  stay part of the one see-through window and follow him when dragged. The
+  window grows above him to hold whichever panel is open. `src/chat/` builds
+  the request and streams the reply with `ureq` on a worker thread, parsing the
   Server-Sent Events; tokens reach the UI through the winit event loop.
+- `src/settings.rs` resolves settings across the command line, environment,
+  and the TOML config file, and reads and writes that file (`toml` + `dirs`).
 
 The software renderer used by the first version of this project (`softbuffer`)
 was replaced because its Wayland backend has no alpha channel.
@@ -154,10 +195,10 @@ cargo test
 The tests cover the animation data (every frame and branch index it refers
 to exists), the player's stepping rules, Clippy's behaviour over a simulated
 45-minute session, sprite compositing and premultiplication, the command
-line, and the chat subsystem — the SSE parser, configuration resolution,
-conversation state, and the streaming client run end to end against an
-in-process mock server. The window and OpenGL code is exercised by running
-the app.
+line, settings resolution and the config-file format, and the chat subsystem
+— the SSE parser, configuration resolution, conversation state, and the
+streaming client run end to end against an in-process mock server. The window,
+OpenGL, and modal UI are exercised by running the app.
 
 ## Credits and licensing
 

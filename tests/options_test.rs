@@ -1,4 +1,4 @@
-use clippy_app::options::{parse, ChatArgs, Command, Options, DEFAULT_SCALE, USAGE};
+use clippy_app::options::{parse, ChatArgs, CliArgs, Command, USAGE};
 use clippy_app::renderer::shader_sources;
 
 fn args(list: &[&str]) -> Vec<String> {
@@ -6,18 +6,20 @@ fn args(list: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn no_arguments_means_defaults() {
-    assert_eq!(parse(args(&[])), Ok(Command::Run(Options::default())));
-    assert_eq!(Options::default().scale, DEFAULT_SCALE);
-    assert!(Options::default().always_on_top);
+fn no_arguments_means_everything_unset() {
+    assert_eq!(parse(args(&[])), Ok(Command::Run(CliArgs::default())));
+    let default = CliArgs::default();
+    assert_eq!(default.scale, None);
+    assert_eq!(default.always_on_top, None);
+    assert_eq!(default.chat, ChatArgs::default());
 }
 
 #[test]
 fn scale_accepts_both_spellings_within_range() {
-    let expected = |scale| {
-        Ok(Command::Run(Options {
-            scale,
-            ..Options::default()
+    let expected = |scale: u32| {
+        Ok(Command::Run(CliArgs {
+            scale: Some(scale),
+            ..Default::default()
         }))
     };
     assert_eq!(parse(args(&["--scale", "3"])), expected(3));
@@ -34,9 +36,9 @@ fn scale_accepts_both_spellings_within_range() {
 fn window_level_flag_and_informational_commands() {
     assert_eq!(
         parse(args(&["--no-always-on-top"])),
-        Ok(Command::Run(Options {
-            always_on_top: false,
-            ..Options::default()
+        Ok(Command::Run(CliArgs {
+            always_on_top: Some(false),
+            ..Default::default()
         }))
     );
     assert_eq!(parse(args(&["--help"])), Ok(Command::Help));
@@ -55,23 +57,23 @@ fn unknown_options_are_errors_that_name_the_offender() {
 
 #[test]
 fn chat_flags_default_to_unset() {
-    assert_eq!(Options::default().chat, ChatArgs::default());
     assert_eq!(ChatArgs::default().base_url, None);
     assert_eq!(ChatArgs::default().model, None);
     assert_eq!(ChatArgs::default().api_key, None);
     assert!(USAGE.contains("--base-url") && USAGE.contains("--model"));
+    assert!(USAGE.contains("F2"));
 }
 
 #[test]
 fn chat_flags_parse_in_both_spellings() {
     let expected = |base: &str, model: &str, key: Option<&str>| {
-        Ok(Command::Run(Options {
+        Ok(Command::Run(CliArgs {
             chat: ChatArgs {
                 base_url: Some(base.to_string()),
                 model: Some(model.to_string()),
                 api_key: key.map(String::from),
             },
-            ..Options::default()
+            ..Default::default()
         }))
     };
     assert_eq!(
@@ -108,13 +110,13 @@ fn chat_flags_coexist_with_other_options() {
         "http://h/v1",
     ]))
     .unwrap();
-    let Command::Run(options) = command else {
+    let Command::Run(cli) = command else {
         panic!("expected Run");
     };
-    assert_eq!(options.scale, 4);
-    assert!(!options.always_on_top);
-    assert_eq!(options.chat.model.as_deref(), Some("m"));
-    assert_eq!(options.chat.base_url.as_deref(), Some("http://h/v1"));
+    assert_eq!(cli.scale, Some(4));
+    assert_eq!(cli.always_on_top, Some(false));
+    assert_eq!(cli.chat.model.as_deref(), Some("m"));
+    assert_eq!(cli.chat.base_url.as_deref(), Some("http://h/v1"));
 }
 
 #[test]

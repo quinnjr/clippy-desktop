@@ -12,6 +12,8 @@ pub enum BalloonAction {
     Submit(String),
     /// The user closed the balloon.
     Close,
+    /// The user asked to open the settings modal.
+    Settings,
 }
 
 /// Where to place the balloon, in egui points.
@@ -71,6 +73,9 @@ pub fn show(
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("\u{00d7}").on_hover_text("Close").clicked() {
                             action = BalloonAction::Close;
+                        }
+                        if ui.small_button("Settings").clicked() {
+                            action = BalloonAction::Settings;
                         }
                     });
                 });

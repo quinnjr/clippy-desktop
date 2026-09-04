@@ -80,6 +80,12 @@ impl ChatState {
         self.config.is_ok()
     }
 
+    /// Points chat at a new server (from the settings modal). The transcript is
+    /// kept; the change takes effect on the next prompt.
+    pub fn set_config(&mut self, config: Result<ChatConfig, Unconfigured>) {
+        self.config = config;
+    }
+
     /// The configuration, if chat is set up.
     pub fn config(&self) -> Option<&ChatConfig> {
         self.config.as_ref().ok()

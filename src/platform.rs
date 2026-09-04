@@ -12,6 +12,8 @@ pub enum MenuAction {
     Animate,
     /// "Ask Clippy…": open the chat balloon.
     Chat,
+    /// "Settings…": open the settings modal.
+    Settings,
     Quit,
 }
 
@@ -23,6 +25,7 @@ mod native {
     use winit::window::Window;
 
     const CHAT_ID: &str = "chat";
+    const SETTINGS_ID: &str = "settings";
     const ANIMATE_ID: &str = "animate";
     const QUIT_ID: &str = "quit";
 
@@ -34,9 +37,16 @@ mod native {
         pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
             let menu = Menu::new();
             let chat = MenuItem::with_id(CHAT_ID, "Ask Clippy\u{2026}", true, None);
+            let settings = MenuItem::with_id(SETTINGS_ID, "Settings\u{2026}", true, None);
             let animate = MenuItem::with_id(ANIMATE_ID, "Animate!", true, None);
             let quit = MenuItem::with_id(QUIT_ID, "Quit", true, None);
-            menu.append_items(&[&chat, &animate, &PredefinedMenuItem::separator(), &quit])?;
+            menu.append_items(&[
+                &chat,
+                &settings,
+                &animate,
+                &PredefinedMenuItem::separator(),
+                &quit,
+            ])?;
             Ok(Self { menu })
         }
 
@@ -81,6 +91,7 @@ mod native {
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let action = match event.id.0.as_str() {
                 CHAT_ID => MenuAction::Chat,
+                SETTINGS_ID => MenuAction::Settings,
                 ANIMATE_ID => MenuAction::Animate,
                 QUIT_ID => MenuAction::Quit,
                 _ => return,

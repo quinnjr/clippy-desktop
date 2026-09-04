@@ -170,3 +170,39 @@ script needs the target's C/assembler toolchain, so cross-compiling from Linux
 to Windows/macOS fails at `ring` (it builds on a real host). The project's own
 platform-specific Rust was type-checked for `x86_64-pc-windows-msvc` and both
 Apple targets by temporarily dropping ureq's TLS feature.
+
+---
+
+## Addendum: Settings modal and config file (2026-09-04)
+
+A modal to change settings while Clippy runs, persisted to a config file.
+
+**Decision** (asked and answered): persist to a TOML file in the platform
+config dir; command line and `OPENAI_*` env still win over the file. Load
+order, highest first: **CLI flags → env → config file → defaults**.
+
+**Layering.** `options.rs` now parses only what the user passed (a `CliArgs`
+with `Option` fields). `settings.rs` merges CLI + env + file + defaults into an
+effective `Settings { scale, always_on_top, chat }`, reads/writes the file
+(`toml` + `dirs`), and shares `chat::config::build` with the flags/env resolver
+so both paths clean and validate identically.
+
+**UI.** The chat balloon and the settings modal are unified under one `Overlay`
+enum (`None` / `Chat` / `Settings`); the window grows above Clippy to fit
+whichever panel is open, and a single `PanelAction` dispatches submit / close /
+open-settings / save-settings after the egui frame. The modal (`ui/settings.rs`)
+is an egui card over a dimmed backdrop with the chat server (base URL, model,
+API key — masked), a size slider, an always-on-top checkbox, Save/Cancel, and
+the config path. Opened by F2, the balloon's *Settings* button, or *Settings…*
+in the native menu (Windows/macOS). Save writes the file, applies live
+(`ChatState::set_config`, window level, scale → window resize), and closes;
+a write failure keeps the modal open with the error shown. The first field is
+auto-focused.
+
+**Verification.** `settings_test.rs` covers precedence (CLI > env > file >
+default for chat; CLI > file > default for appearance), scale clamping, and the
+TOML round-trip (partial files load; an empty API key is omitted) without
+touching the real config file. Manually: opened the modal, filled the server,
+Saved — the `config.toml` was written with the right fields and chat turned on
+live, then a prompt streamed a reply. Type-checks for the Windows and both
+Apple targets (`toml` and `dirs` are pure Rust).

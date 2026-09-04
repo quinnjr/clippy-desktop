@@ -13,6 +13,7 @@ pub mod companion;
 pub mod options;
 pub mod platform;
 pub mod renderer;
+pub mod settings;
 pub mod sprite;
 pub mod ui;
 

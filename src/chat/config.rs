@@ -39,20 +39,31 @@ pub fn resolve(args: &ChatArgs) -> Result<ChatConfig, Unconfigured> {
     resolve_from(args, |name| std::env::var(name).ok())
 }
 
-/// The resolution logic, with the environment injected for testing.
+/// The flags-plus-environment resolution, with the environment injected for
+/// testing. Command-line flags win over the environment.
 pub fn resolve_from(
     args: &ChatArgs,
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<ChatConfig, Unconfigured> {
-    let base_url = first_non_empty(args.base_url.clone(), || env("OPENAI_BASE_URL"));
-    let model = first_non_empty(args.model.clone(), || env("OPENAI_MODEL"));
-    let api_key = first_non_empty(args.api_key.clone(), || env("OPENAI_API_KEY"));
+    build(
+        first_non_empty(args.base_url.clone(), || env("OPENAI_BASE_URL")),
+        first_non_empty(args.model.clone(), || env("OPENAI_MODEL")),
+        first_non_empty(args.api_key.clone(), || env("OPENAI_API_KEY")),
+    )
+}
 
-    match (base_url, model) {
+/// Builds a chat target from already-merged values, or explains what is
+/// missing. Trims surrounding whitespace and drops empty strings.
+pub fn build(
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+) -> Result<ChatConfig, Unconfigured> {
+    match (clean(base_url), clean(model)) {
         (Some(base_url), Some(model)) => Ok(ChatConfig {
             base_url: base_url.trim_end_matches('/').to_string(),
             model,
-            api_key,
+            api_key: clean(api_key),
         }),
         (base_url, model) => {
             let mut missing = Vec::new();
@@ -69,12 +80,16 @@ pub fn resolve_from(
     }
 }
 
+/// Trims whitespace and treats an empty string as absent.
+pub fn clean(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn first_non_empty(
     primary: Option<String>,
     fallback: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    primary
-        .or_else(fallback)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    clean(primary).or_else(|| clean(fallback()))
 }

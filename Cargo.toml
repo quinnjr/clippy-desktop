@@ -43,6 +43,10 @@ egui_glow = "0.33"
 # servers.
 ureq = "3"
 
+# Persisted settings: a TOML file in the platform config directory.
+toml = "0.8"
+dirs = "6"
+
 # Native right-click menu on Windows and macOS. Linux uses the keyboard
 # (Escape / Q) because winit has no GTK window for a native popup there.
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]

@@ -1,20 +1,23 @@
-//! The window, its OpenGL surface, the chat balloon, and the event loop.
+//! The window, its OpenGL surface, the chat balloon, the settings modal, and
+//! the event loop.
 //!
 //! The window is borderless, transparent and (by default) always on top. When
-//! the chat balloon is closed it is exactly Clippy's size; when it opens, the
-//! window grows upward to hold the balloon above him and shrinks again when it
-//! closes. Clippy is drawn by the sprite renderer into the bottom of the
-//! window; the balloon is drawn by egui over the top, both on the same GL
-//! context so the whole thing stays a single see-through window.
+//! no overlay is open it is exactly Clippy's size; opening the chat balloon or
+//! the settings modal grows the window upward to hold the panel above him and
+//! shrinks it again when the panel closes. Clippy is drawn by the sprite
+//! renderer into the bottom of the window; the panel is drawn by egui over the
+//! top, both on the same GL context so the whole thing stays a single
+//! see-through window.
 
 use crate::agent::Agent;
 use crate::chat::{self, ChatEvent, ChatState, Status};
 use crate::companion::Companion;
-use crate::options::Options;
+use crate::options::CliArgs;
 use crate::platform::{self, ContextMenuHandle, MenuAction};
 use crate::renderer::Renderer;
+use crate::settings::{self, Settings};
 use crate::sprite::SpriteSheet;
-use crate::ui::{self, BalloonAction, BalloonLayout};
+use crate::ui::{self, BalloonAction, BalloonLayout, SettingsAction, SettingsDraft};
 use glutin::config::{Config, ConfigTemplateBuilder, GetGlConfig};
 use glutin::context::{
     ContextApi, ContextAttributesBuilder, NotCurrentContext, PossiblyCurrentContext, Version,
@@ -42,14 +45,16 @@ const DRAG_THRESHOLD: f64 = 4.0;
 const MARGIN_RIGHT: f64 = 48.0;
 const MARGIN_BOTTOM: f64 = 96.0;
 
-/// Balloon geometry, in logical pixels (egui points).
+/// Panel geometry, in logical pixels (egui points).
 const BALLOON_W: f64 = 340.0;
 const BALLOON_H: f64 = 250.0;
+const SETTINGS_W: f64 = 360.0;
+const SETTINGS_H: f64 = 440.0;
 const TAIL: f64 = 18.0;
-const BALLOON_PAD: f32 = 4.0;
+const PANEL_PAD: f32 = 4.0;
 
-/// Frame budget while the balloon is open, so the caret blinks and streamed
-/// text appears promptly without spinning the CPU.
+/// Frame budget while a panel is open, so the caret blinks and streamed text
+/// appears promptly without spinning the CPU.
 const OPEN_FRAME: Duration = Duration::from_millis(33);
 
 /// Animations Clippy plays around a chat.
@@ -58,6 +63,23 @@ const WRITING: &str = "Writing";
 const ANSWERED: &str = "GetAttention";
 const FAILED: &str = "Alert";
 
+/// Which panel, if any, is open above Clippy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overlay {
+    None,
+    Chat,
+    Settings,
+}
+
+/// What a panel asked the app to do after a frame.
+enum PanelAction {
+    None,
+    Submit(String),
+    CloseOverlay,
+    OpenSettings,
+    SaveSettings,
+}
+
 #[derive(Debug, Clone)]
 pub enum UserEvent {
     Menu(MenuAction),
@@ -65,18 +87,19 @@ pub enum UserEvent {
 }
 
 /// Runs Clippy until the user quits.
-pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
+pub fn run(cli: CliArgs) -> Result<(), Box<dyn Error>> {
     let agent = Agent::clippy();
     let sheet = SpriteSheet::clippy();
     agent.validate(sheet.width(), sheet.height())?;
 
-    let chat_config = chat::resolve(&options.chat);
-    if let Err(unconfigured) = &chat_config {
+    let file = settings::load();
+    let settings = settings::resolve(&cli, &file);
+    if let Err(unconfigured) = &settings.chat {
         eprintln!(
             "clippy-app: {}",
             unconfigured.message.replace('\n', "\nclippy-app: ")
         );
-        eprintln!("clippy-app: (Clippy will still keep you company.)");
+        eprintln!("clippy-app: (Clippy will still keep you company; press F2 to set this up.)");
     }
 
     #[cfg(target_os = "linux")]
@@ -104,7 +127,7 @@ pub fn run(options: Options) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let mut app = App::new(options, agent, sheet, menu, chat_config, proxy);
+    let mut app = App::new(settings, agent, sheet, menu, proxy);
     event_loop.run_app(&mut app)?;
     app.exit_state
 }
@@ -123,7 +146,8 @@ struct WindowState {
 }
 
 struct App {
-    options: Options,
+    scale: u32,
+    always_on_top: bool,
     sheet: SpriteSheet,
     companion: Companion,
     menu: Option<ContextMenuHandle>,
@@ -141,9 +165,13 @@ struct App {
     /// Where the left button went down, until it becomes a drag or a click.
     press: Option<PhysicalPosition<f64>>,
     chat: ChatState,
-    balloon_open: bool,
+    overlay: Overlay,
     balloon_input: String,
     balloon_focus: bool,
+    settings_draft: SettingsDraft,
+    settings_error: Option<String>,
+    settings_focus: bool,
+    config_path: String,
     proxy: EventLoopProxy<UserEvent>,
     /// Bumped for each request so late events from an old one are ignored.
     generation: u64,
@@ -154,11 +182,10 @@ struct App {
 
 impl App {
     fn new(
-        options: Options,
+        settings: Settings,
         agent: Agent,
         sheet: SpriteSheet,
         menu: Option<ContextMenuHandle>,
-        chat_config: Result<chat::ChatConfig, chat::Unconfigured>,
         proxy: EventLoopProxy<UserEvent>,
     ) -> Self {
         // Ask for an alpha channel everywhere. Only macOS needs the explicit
@@ -169,8 +196,11 @@ impl App {
             .with_transparency(cfg!(target_os = "macos"));
         let egui_ctx = egui::Context::default();
         egui_ctx.set_visuals(egui::Visuals::light());
+        let scale = settings.scale;
+        let always_on_top = settings.always_on_top;
         Self {
-            options,
+            scale,
+            always_on_top,
             sheet,
             companion: Companion::new(agent, Instant::now()),
             menu,
@@ -184,10 +214,20 @@ impl App {
             uploaded: None,
             cursor: PhysicalPosition::new(0.0, 0.0),
             press: None,
-            chat: ChatState::new(chat_config),
-            balloon_open: false,
+            chat: ChatState::new(settings.chat),
+            overlay: Overlay::None,
             balloon_input: String::new(),
             balloon_focus: false,
+            settings_draft: SettingsDraft {
+                base_url: String::new(),
+                model: String::new(),
+                api_key: String::new(),
+                scale,
+                always_on_top,
+            },
+            settings_error: None,
+            settings_focus: false,
+            config_path: settings::config_path_display(),
             proxy,
             generation: 0,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -200,41 +240,48 @@ impl App {
         event_loop.exit();
     }
 
+    fn overlay_open(&self) -> bool {
+        self.overlay != Overlay::None
+    }
+
     /// Clippy's on-screen size, in logical pixels.
     fn clippy_logical(&self) -> (f64, f64) {
         let (fw, fh) = self.companion.agent().frame_size();
-        let scale = self.options.scale as f64;
+        let scale = self.scale as f64;
         (fw as f64 * scale, fh as f64 * scale)
     }
 
-    /// The window's logical size for the current balloon state.
+    /// The window's logical size for the current overlay.
     fn window_logical(&self) -> LogicalSize<f64> {
         let (clw, clh) = self.clippy_logical();
-        if self.balloon_open {
-            LogicalSize::new(clw.max(BALLOON_W), BALLOON_H + TAIL + clh)
-        } else {
-            LogicalSize::new(clw, clh)
+        match self.overlay {
+            Overlay::None => LogicalSize::new(clw, clh),
+            Overlay::Chat => LogicalSize::new(clw.max(BALLOON_W), BALLOON_H + TAIL + clh),
+            Overlay::Settings => LogicalSize::new(clw.max(SETTINGS_W), SETTINGS_H + TAIL + clh),
         }
     }
 
     fn window_attributes(&self, event_loop: &ActiveEventLoop) -> WindowAttributes {
         let logical = self.window_logical();
-        let level = if self.options.always_on_top {
-            WindowLevel::AlwaysOnTop
-        } else {
-            WindowLevel::Normal
-        };
         let mut attributes = Window::default_attributes()
             .with_title("Clippy")
             .with_inner_size(logical)
             .with_resizable(false)
             .with_decorations(false)
             .with_transparent(true)
-            .with_window_level(level);
+            .with_window_level(self.window_level());
         if let Some(position) = initial_position(event_loop, logical) {
             attributes = attributes.with_position(position);
         }
         attributes
+    }
+
+    fn window_level(&self) -> WindowLevel {
+        if self.always_on_top {
+            WindowLevel::AlwaysOnTop
+        } else {
+            WindowLevel::Normal
+        }
     }
 
     fn request_redraw(&self) {
@@ -248,19 +295,19 @@ impl App {
         self.request_redraw();
     }
 
-    /// Opens or closes the balloon, resizing the window and keeping Clippy
+    /// Switches which panel is open, resizing the window and keeping Clippy
     /// anchored where he is.
-    fn set_balloon(&mut self, open: bool) {
-        if self.balloon_open == open {
+    fn set_overlay(&mut self, target: Overlay) {
+        if self.overlay == target {
             return;
         }
-        // Closing mid-reply abandons the request so Clippy does not keep
+        // Leaving the chat abandons an in-flight reply so Clippy does not keep
         // thinking with no balloon (and later react out of nowhere).
-        if !open {
+        if self.overlay == Overlay::Chat {
             self.cancel_request(Instant::now());
         }
-        self.balloon_open = open;
-        if open {
+        self.overlay = target;
+        if target == Overlay::Chat {
             self.balloon_focus = true;
         }
 
@@ -339,7 +386,61 @@ impl App {
             }
         }
         // No native menu (Linux), or it could not be shown: open the chat.
-        self.set_balloon(true);
+        self.set_overlay(Overlay::Chat);
+    }
+
+    /// Fills the settings draft from the current settings and opens the modal.
+    fn open_settings(&mut self) {
+        let (base_url, model, api_key) = match self.chat.config() {
+            Some(config) => (
+                config.base_url.clone(),
+                config.model.clone(),
+                config.api_key.clone().unwrap_or_default(),
+            ),
+            None => (String::new(), String::new(), String::new()),
+        };
+        self.settings_draft = SettingsDraft {
+            base_url,
+            model,
+            api_key,
+            scale: self.scale,
+            always_on_top: self.always_on_top,
+        };
+        self.settings_error = None;
+        self.settings_focus = true;
+        self.set_overlay(Overlay::Settings);
+    }
+
+    /// Persists the draft to the config file and applies it live. Stays open
+    /// (with an error) if the file could not be written.
+    fn save_settings(&mut self) {
+        let draft = self.settings_draft.clone();
+        let file = settings::file_from(
+            draft.scale,
+            draft.always_on_top,
+            &draft.base_url,
+            &draft.model,
+            &draft.api_key,
+        );
+        if let Err(err) = settings::save(&file) {
+            self.settings_error = Some(err);
+            self.request_redraw();
+            return;
+        }
+
+        self.chat.set_config(chat::config::build(
+            Some(draft.base_url.clone()),
+            Some(draft.model.clone()),
+            Some(draft.api_key.clone()),
+        ));
+        self.always_on_top = draft.always_on_top;
+        if let Some(state) = &self.state {
+            state.window.set_window_level(self.window_level());
+        }
+        // Set the scale before closing so the window shrinks to the new size.
+        self.scale = draft.scale;
+        self.settings_error = None;
+        self.set_overlay(Overlay::None);
     }
 
     /// Sends a prompt to the server on a worker thread, and sets Clippy thinking.
@@ -399,9 +500,9 @@ impl App {
         if self.gl_context.is_none() {
             return;
         }
-        let balloon_open = self.balloon_open;
+        let overlay = self.overlay;
         let (clw, clh) = self.clippy_logical();
-        let mut action = BalloonAction::None;
+        let mut panel = PanelAction::None;
 
         {
             let Some(state) = self.state.as_mut() else {
@@ -435,27 +536,56 @@ impl App {
             let scale_factor = window.scale_factor() as f32;
 
             renderer.clear();
-            // Clippy fills the window when closed, or its bottom-centre when open.
-            let (clippy_w, clippy_h, x0) = if balloon_open {
+            // Clippy fills the window with no overlay, or its bottom-centre with one.
+            let (clippy_w, clippy_h, x0) = if overlay == Overlay::None {
+                (inner.width as i32, inner.height as i32, 0)
+            } else {
                 let cw = (clw as f32 * scale_factor).round() as i32;
                 let ch = (clh as f32 * scale_factor).round() as i32;
                 (cw, ch, (inner.width as i32 - cw) / 2)
-            } else {
-                (inner.width as i32, inner.height as i32, 0)
             };
             renderer.draw(x0, 0, clippy_w, clippy_h);
 
-            if balloon_open {
+            if overlay != Overlay::None {
                 let egui_ctx = self.egui_ctx.clone();
                 let egui_state = self.egui_state.as_mut().expect("created with the window");
                 let raw_input = egui_state.take_egui_input(window);
-                let layout = balloon_layout(inner, scale_factor, clh as f32);
+                let win_w = inner.width as f32 / scale_factor;
+                let win_h = inner.height as f32 / scale_factor;
+                let balloon = balloon_layout(win_w, win_h, clh as f32);
+                let (settings_pos, settings_size) = settings_layout(win_w, win_h, clh as f32);
 
                 let chat = &self.chat;
                 let input = &mut self.balloon_input;
                 let focus = &mut self.balloon_focus;
-                let full = egui_ctx.run(raw_input, |ctx| {
-                    action = ui::show(ctx, &layout, chat, input, focus);
+                let draft = &mut self.settings_draft;
+                let error = self.settings_error.as_deref();
+                let config_path = self.config_path.as_str();
+                let focus_first = &mut self.settings_focus;
+
+                let full = egui_ctx.run(raw_input, |ctx| match overlay {
+                    Overlay::Chat => match ui::balloon::show(ctx, &balloon, chat, input, focus) {
+                        BalloonAction::None => {}
+                        BalloonAction::Submit(text) => panel = PanelAction::Submit(text),
+                        BalloonAction::Close => panel = PanelAction::CloseOverlay,
+                        BalloonAction::Settings => panel = PanelAction::OpenSettings,
+                    },
+                    Overlay::Settings => {
+                        match ui::settings::show(
+                            ctx,
+                            settings_pos,
+                            settings_size,
+                            draft,
+                            config_path,
+                            error,
+                            focus_first,
+                        ) {
+                            SettingsAction::None => {}
+                            SettingsAction::Save => panel = PanelAction::SaveSettings,
+                            SettingsAction::Cancel => panel = PanelAction::CloseOverlay,
+                        }
+                    }
+                    Overlay::None => {}
                 });
                 egui_state.handle_platform_output(window, full.platform_output);
                 let primitives = egui_ctx.tessellate(full.shapes, full.pixels_per_point);
@@ -473,10 +603,12 @@ impl App {
             }
         }
 
-        match action {
-            BalloonAction::Submit(text) => self.submit_prompt(text),
-            BalloonAction::Close => self.set_balloon(false),
-            BalloonAction::None => {}
+        match panel {
+            PanelAction::None => {}
+            PanelAction::Submit(text) => self.submit_prompt(text),
+            PanelAction::CloseOverlay => self.set_overlay(Overlay::None),
+            PanelAction::OpenSettings => self.open_settings(),
+            PanelAction::SaveSettings => self.save_settings(),
         }
     }
 
@@ -590,9 +722,9 @@ impl ApplicationHandler<UserEvent> for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        // Feed egui first while the balloon is open.
+        // Feed egui first while a panel is open.
         let consumed = if let (true, Some(egui_state), Some(state)) = (
-            self.balloon_open,
+            self.overlay_open(),
             self.egui_state.as_mut(),
             self.state.as_ref(),
         ) {
@@ -643,7 +775,8 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Menu(MenuAction::Animate) => self.poke(),
-            UserEvent::Menu(MenuAction::Chat) => self.set_balloon(true),
+            UserEvent::Menu(MenuAction::Chat) => self.set_overlay(Overlay::Chat),
+            UserEvent::Menu(MenuAction::Settings) => self.open_settings(),
             UserEvent::Menu(MenuAction::Quit) => event_loop.exit(),
             UserEvent::Chat { generation, event } if generation == self.generation => {
                 self.on_chat_event(event)
@@ -661,7 +794,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.request_redraw();
         }
         let mut deadline = self.companion.next_deadline();
-        if self.balloon_open {
+        if self.overlay_open() {
             let soon = Instant::now() + OPEN_FRAME;
             deadline = Some(deadline.map_or(soon, |existing| existing.min(soon)));
         }
@@ -705,16 +838,17 @@ impl App {
         }
         match event.logical_key {
             Key::Named(NamedKey::Escape) => {
-                if self.balloon_open {
-                    self.set_balloon(false);
+                if self.overlay_open() {
+                    self.set_overlay(Overlay::None);
                 } else {
                     event_loop.exit();
                 }
             }
-            Key::Named(NamedKey::Enter) if !self.balloon_open => self.set_balloon(true),
-            Key::Named(NamedKey::Space) if !self.balloon_open => self.poke(),
-            Key::Named(NamedKey::Home) if !self.balloon_open => self.recenter(event_loop),
-            Key::Character(text) if !self.balloon_open && text.eq_ignore_ascii_case("q") => {
+            Key::Named(NamedKey::Enter) if !self.overlay_open() => self.set_overlay(Overlay::Chat),
+            Key::Named(NamedKey::F2) if !self.overlay_open() => self.open_settings(),
+            Key::Named(NamedKey::Space) if !self.overlay_open() => self.poke(),
+            Key::Named(NamedKey::Home) if !self.overlay_open() => self.recenter(event_loop),
+            Key::Character(text) if !self.overlay_open() && text.eq_ignore_ascii_case("q") => {
                 event_loop.exit()
             }
             _ => {}
@@ -737,20 +871,23 @@ impl App {
 
 /// Places the balloon in the top of the window, its tail pointing at Clippy's
 /// centre. All values in egui points (== logical pixels).
-fn balloon_layout(
-    inner: PhysicalSize<u32>,
-    scale_factor: f32,
-    clippy_logical_h: f32,
-) -> BalloonLayout {
-    let win_w = inner.width as f32 / scale_factor;
-    let win_h = inner.height as f32 / scale_factor;
-    let body_h = (win_h - clippy_logical_h - TAIL as f32 - BALLOON_PAD).max(48.0);
+fn balloon_layout(win_w: f32, win_h: f32, clippy_logical_h: f32) -> BalloonLayout {
+    let body_h = (win_h - clippy_logical_h - TAIL as f32 - PANEL_PAD).max(48.0);
     BalloonLayout {
-        pos: egui::pos2(BALLOON_PAD, BALLOON_PAD),
-        size: egui::vec2(win_w - 2.0 * BALLOON_PAD, body_h),
+        pos: egui::pos2(PANEL_PAD, PANEL_PAD),
+        size: egui::vec2(win_w - 2.0 * PANEL_PAD, body_h),
         tail_x: win_w / 2.0,
-        tail_y: BALLOON_PAD + body_h,
+        tail_y: PANEL_PAD + body_h,
     }
+}
+
+/// Places the settings card in the top of the window, above Clippy.
+fn settings_layout(win_w: f32, win_h: f32, clippy_logical_h: f32) -> (egui::Pos2, egui::Vec2) {
+    let body_h = (win_h - clippy_logical_h - TAIL as f32 - PANEL_PAD).max(80.0);
+    (
+        egui::pos2(PANEL_PAD, PANEL_PAD),
+        egui::vec2(win_w - 2.0 * PANEL_PAD, body_h),
+    )
 }
 
 /// Bottom-right corner of the primary monitor, with a margin; `None` where the
